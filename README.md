@@ -31,16 +31,14 @@ The wedge is not generic long-term memory. It is provenance-backed engineering c
 Requires Node.js `>=22.5.0`.
 
 ```sh
-npm install
-npm run build
-node dist/cli.js init
-```
-
-For a global npm install after publishing:
-
-```sh
 npm install -g ctxpool
 ctxpool init
+```
+
+For one-off usage without a global install:
+
+```sh
+npx ctxpool --help
 ```
 
 ## Quick Start
@@ -48,13 +46,13 @@ ctxpool init
 Capture a handoff from the current workspace:
 
 ```sh
-node dist/cli.js handoff --from codex --no-ollama
+ctxpool handoff --from codex --no-ollama
 ```
 
 Open the local context builder UI:
 
 ```sh
-node dist/cli.js ui
+ctxpool ui
 ```
 
 Then open:
@@ -76,14 +74,14 @@ Saved packs stay local in the ContextPool store.
 ## CLI
 
 ```sh
-node dist/cli.js init
-node dist/cli.js handoff --from codex --no-ollama
-node dist/cli.js capture --from claude --task billing-flow
-node dist/cli.js ui
-node dist/cli.js tasks
-node dist/cli.js show latest --task billing-flow
-node dist/cli.js team export --task billing-flow
-node dist/cli.js mcp start
+ctxpool init
+ctxpool handoff --from codex --no-ollama
+ctxpool capture --from claude --task billing-flow
+ctxpool ui
+ctxpool tasks
+ctxpool show latest --task billing-flow
+ctxpool team export --task billing-flow
+ctxpool mcp start
 ```
 
 `ctxpool team export` writes a sync-ready JSON packet under the local ContextPool home directory. Raw transcript entries are excluded by default:
@@ -129,10 +127,11 @@ npm test
 npm run build
 ```
 
-Use fixture data for local UI testing:
+When working from source, run CLI commands through the development entrypoint:
 
 ```sh
-CTXPOOL_HOME=.ctxpool-test node dist/cli.js ui
+CTXPOOL_HOME=.ctxpool-test npm run dev -- ui
+npm run dev -- --version
 ```
 
 ## Release Checks

@@ -13,6 +13,12 @@ npm run build
 
 Use focused tests for parser, store, export, and UI-server behavior. Keep local fixture data out of commits.
 
+Public user documentation should prefer the published CLI form, `ctxpool <command>`. Source contributors can run the same commands through the development entrypoint:
+
+```sh
+npm run dev -- <command>
+```
+
 ## Pull Requests
 
 - Keep changes scoped.

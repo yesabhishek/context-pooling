@@ -7,7 +7,7 @@ import { openStore } from "./store.js";
 export async function startMcpServer(): Promise<void> {
   const server = new McpServer({
     name: "contextpool",
-    version: "0.1.0"
+    version: "0.1.1"
   });
 
   server.registerTool(

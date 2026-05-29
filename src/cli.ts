@@ -15,7 +15,7 @@ const program = new Command();
 program
   .name("ctxpool")
   .description("Local-first handoff packets for AI coding agents.")
-  .version("0.1.0");
+  .version("0.1.1");
 
 program.command("init").description("Create the local ContextPool store.").action(async () => {
   const paths = ensureCtxDirs();
