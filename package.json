@@ -1,7 +1,7 @@
 {
   "name": "ctxpool",
-  "version": "0.2.0",
-  "description": "Hand off AI coding sessions between Codex, Claude, and any MCP-capable agent.",
+  "version": "0.3.0",
+  "description": "Hand off AI coding sessions between Codex, Claude, Gemini, and any MCP-capable agent.",
   "type": "module",
   "bin": {
     "ctxpool": "dist/cli.js"
@@ -28,6 +28,7 @@
     "handoff",
     "codex",
     "claude",
+    "gemini",
     "context"
   ],
   "license": "MIT",

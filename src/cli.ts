@@ -8,7 +8,7 @@ import { glyph, heading, line, note, plural, print, printError, relativeTime, ro
 import { buildTeamTimelineExport, createHandoff } from "./handoff.js";
 import { DEFAULT_CONFIG, ensureCtxDirs, getCtxPaths, loadConfig } from "./paths.js";
 import { gitTopLevel } from "./repo.js";
-import { claudeHome, codexHome, listSessionCandidates, sourceLabel, type SessionFrom } from "./session.js";
+import { listSessionCandidates, SOURCE_AGENTS, sourceLabel, sourceSessionDirs, type SessionFrom } from "./session.js";
 import { openStore } from "./store.js";
 import { formatTokens } from "./text.js";
 import type { HandoffPacket } from "./types.js";
@@ -19,7 +19,7 @@ const program = new Command();
 
 program
   .name("ctxpool")
-  .description("Hand off AI coding sessions between Codex, Claude, and any MCP-capable agent.")
+  .description("Hand off AI coding sessions between Codex, Claude, Gemini, and any MCP-capable agent.")
   .version(VERSION, "-v, --version", "Show the version")
   .helpOption("-h, --help", "Show help")
   .helpCommand(false)
@@ -38,7 +38,7 @@ program
       "",
       style.bold("Examples:"),
       `  ctxpool handoff               ${style.dim("Hand off the latest session in this repo")}`,
-      `  ctxpool handoff --from codex  ${style.dim("Choose when both agents were active")}`,
+      `  ctxpool handoff --from codex  ${style.dim("Choose when several agents were active")}`,
       `  ctxpool sessions              ${style.dim("See which sessions ContextPool can read")}`,
       `  ctxpool ui                    ${style.dim("Curate reusable context packs in the browser")}`,
       ""
@@ -48,7 +48,7 @@ program
 program.action(() => program.help());
 
 const fromOption = () =>
-  new Option("--from <agent>", "Source agent").choices(["auto", "codex", "claude"]).default("auto");
+  new Option("--from <agent>", "Source agent").choices(["auto", ...SOURCE_AGENTS]).default("auto");
 const budgetOption = () => new Option("--budget <tokens>", "Token budget for the transcript excerpt").argParser(positiveInt);
 
 type CaptureOptions = {
@@ -68,7 +68,7 @@ program
   .description("Capture the current session and copy a handoff to the clipboard")
   .option("--task <name>", "Task name (defaults to the branch or repo name)")
   .addOption(fromOption())
-  .option("--session <id|path>", "Use a specific session id or .jsonl file")
+  .option("--session <id|path>", "Use a specific session id or session file")
   .option("--to <agent>", "Name the agent that will pick this up")
   .option("--no-transcript", "Leave the recent transcript out of the handoff")
   .addOption(budgetOption())
@@ -89,7 +89,7 @@ program
   .description("Capture the current session without touching the clipboard")
   .option("--task <name>", "Task name (defaults to the branch or repo name)")
   .addOption(fromOption())
-  .option("--session <id|path>", "Use a specific session id or .jsonl file")
+  .option("--session <id|path>", "Use a specific session id or session file")
   .option("--no-transcript", "Leave the recent transcript out of the handoff")
   .addOption(budgetOption())
   .option("--ollama", "Ask a local Ollama model to phrase the next action")
@@ -103,7 +103,7 @@ program
 
 program
   .command("sessions")
-  .description("List the Codex and Claude sessions ContextPool can read")
+  .description("List the Codex, Claude, and Gemini sessions ContextPool can read")
   .addOption(fromOption())
   .option("--all", "Include sessions from other folders")
   .option("-n, --limit <count>", "How many to show", positiveInt, 10)
@@ -120,7 +120,7 @@ program
       return print([
         heading("No sessions here", place),
         "",
-        note(candidates.length ? "Other folders have sessions. Run `ctxpool sessions --all` to see them." : `Looked in ${tildePath(codexHome())} and ${tildePath(claudeHome())}.`)
+        note(candidates.length ? "Other folders have sessions. Run `ctxpool sessions --all` to see them." : `Looked in ${Object.values(sourceSessionDirs()).map(tildePath).join(", ")}.`)
       ]);
     }
     const pick = visible.find((candidate) => candidate.matchedCwd);
@@ -150,7 +150,7 @@ program
     withStore((store) => {
       const tasks = store.listTasks();
       if (options.json) return printJson(tasks);
-      if (!tasks.length) return print([heading("No handoffs yet"), "", note("Run `ctxpool handoff` in a repo where you've used Codex or Claude.")]);
+      if (!tasks.length) return print([heading("No handoffs yet"), "", note("Run `ctxpool handoff` in a repo where you've used Codex, Claude, or Gemini.")]);
       print([
         heading("Tasks"),
         "",
@@ -182,7 +182,8 @@ program
   .action((options: { json?: boolean }) =>
     withStore((store) => {
       const status = store.getStatus();
-      const agents = { codex: existsSync(join(codexHome(), "sessions")), claude: existsSync(join(claudeHome(), "projects")) };
+      const dirs = sourceSessionDirs();
+      const agents = Object.fromEntries(SOURCE_AGENTS.map((source) => [source, existsSync(dirs[source])]));
       if (options.json) return printJson({ version: VERSION, ...status, agents });
       print([
         heading("ContextPool", VERSION),
@@ -192,7 +193,7 @@ program
           ["Tasks", String(status.taskCount)],
           ["Handoffs", String(status.handoffCount)],
           ["Packs", String(status.packCount)],
-          ["Agents", `${agents.claude ? glyph.ok : glyph.idle} Claude   ${agents.codex ? glyph.ok : glyph.idle} Codex`]
+          ["Agents", SOURCE_AGENTS.map((source) => `${agents[source] ? glyph.ok : glyph.idle} ${sourceLabel(source)}`).join("   ")]
         ])
       ]);
     })
@@ -205,7 +206,7 @@ program
     withStore(() => {
       const paths = ensureCtxDirs();
       if (!existsSync(paths.configPath)) writeFileSync(paths.configPath, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, { mode: 0o600 });
-      print([line(`${glyph.ok} ContextPool is ready`), note(`  ${tildePath(paths.home)}`), "", note("Next: run `ctxpool handoff` in a repo where you've used Codex or Claude.")]);
+      print([line(`${glyph.ok} ContextPool is ready`), note(`  ${tildePath(paths.home)}`), "", note("Next: run `ctxpool handoff` in a repo where you've used Codex, Claude, or Gemini.")]);
     })
   );
 
@@ -258,6 +259,7 @@ const mcp = program
       style.bold("Connect an agent:"),
       "  claude mcp add contextpool -- npx -y ctxpool mcp start",
       "  codex mcp add contextpool -- npx -y ctxpool mcp start",
+      "  gemini mcp add -s user contextpool npx -y ctxpool mcp start",
       ""
     ].join("\n")
   );

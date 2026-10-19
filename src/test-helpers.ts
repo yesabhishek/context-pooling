@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -14,11 +15,13 @@ export function writeJsonl(path: string, records: unknown[]): string {
 }
 
 /** Point every store and agent directory at fresh temp folders so tests never read real sessions. */
-export function isolateEnv(): { home: string; codexHome: string; claudeHome: string } {
-  const env = { home: tempDir("home"), codexHome: tempDir("codex"), claudeHome: tempDir("claude") };
+export function isolateEnv(): { home: string; codexHome: string; claudeHome: string; geminiHome: string } {
+  const geminiCliHome = tempDir("gemini");
+  const env = { home: tempDir("home"), codexHome: tempDir("codex"), claudeHome: tempDir("claude"), geminiHome: join(geminiCliHome, ".gemini") };
   process.env.CTXPOOL_HOME = env.home;
   process.env.CODEX_HOME = env.codexHome;
   process.env.CLAUDE_CONFIG_DIR = env.claudeHome;
+  process.env.GEMINI_CLI_HOME = geminiCliHome;
   return env;
 }
 
@@ -71,4 +74,53 @@ export const codex = {
   command: (command: string, exitCode: number, output = "") =>
     codex.item({ type: "CommandExecution", command: ["/bin/zsh", "-lc", command], exit_code: exitCode, status: exitCode === 0 ? "completed" : "failed", aggregated_output: output }),
   fileChange: (path: string) => codex.item({ type: "FileChange", changes: { [path]: { type: "update", unified_diff: "" } }, status: "completed" })
+};
+
+// Records in the shape Gemini CLI writes to ~/.gemini/tmp/<project>/chats/session-<time>-<id>.jsonl
+export const gemini = {
+  /** Creates tmp/<name> with the .project_root marker Gemini CLI writes, and returns its chats folder. */
+  project: (geminiHome: string, root: string, name = "work") => {
+    const dir = join(geminiHome, "tmp", name);
+    mkdirSync(join(dir, "chats"), { recursive: true });
+    writeFileSync(join(dir, ".project_root"), root);
+    return join(dir, "chats");
+  },
+  meta: (sessionId: string, projectRoot: string, extra: Record<string, unknown> = {}) => ({
+    sessionId,
+    projectHash: createHash("sha256").update(projectRoot).digest("hex"),
+    startTime: "2026-10-19T10:00:00.000Z",
+    lastUpdated: "2026-10-19T10:00:00.000Z",
+    kind: "main",
+    ...extra
+  }),
+  user: (id: string, content: unknown, extra: Record<string, unknown> = {}) => ({
+    id,
+    timestamp: "2026-10-19T10:00:00.000Z",
+    type: "user",
+    content: typeof content === "string" ? [{ text: content }] : content,
+    ...extra
+  }),
+  reply: (id: string, text: string, toolCalls?: unknown[]) => ({
+    id,
+    timestamp: "2026-10-19T10:01:00.000Z",
+    type: "gemini",
+    content: text,
+    thoughts: [{ subject: "Planning", description: "Thinking it through", timestamp: "2026-10-19T10:00:30.000Z" }],
+    model: "gemini-3-pro-preview",
+    ...(toolCalls ? { toolCalls } : {})
+  }),
+  tool: (id: string, name: string, args: Record<string, unknown>, output: string, status = "success") => ({
+    id,
+    name,
+    args,
+    result: [{ functionResponse: { id, name, response: { output } } }],
+    status,
+    timestamp: "2026-10-19T10:01:00.000Z",
+    displayName: name,
+    description: "",
+    renderOutputAsMarkdown: false
+  }),
+  /** The shell tool reports stdout after "Output: " and appends "Exit Code: N" only when N is non-zero. */
+  shell: (id: string, command: string, exitCode: number, output = "") =>
+    gemini.tool(id, "run_shell_command", { command }, [`Output: ${output || "(empty)"}`, ...(exitCode ? [`Exit Code: ${exitCode}`] : []), "Process Group PGID: 4242"].join("\n"))
 };

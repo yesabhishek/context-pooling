@@ -2,7 +2,7 @@
 
 Hand off AI coding sessions between agents without losing the thread.
 
-ContextPool reads the Codex or Claude session you just worked in, pairs it with the repo's git state, and writes a short handoff the next agent can act on: what was asked, the plan, which checks passed or failed, what changed, and the next action. Everything stays on your machine.
+ContextPool reads the Codex, Claude Code, or Gemini CLI session you just worked in, pairs it with the repo's git state, and writes a short handoff the next agent can act on: what was asked, the plan, which checks passed or failed, what changed, and the next action. Everything stays on your machine.
 
 ```sh
 npm install -g ctxpool
@@ -27,10 +27,21 @@ Paste it into the next agent, or let the agent fetch it over MCP.
 
 ## How it works
 
-- **Reads the agent's own records.** Plans come from the agent's to-do tools (`TodoWrite`, `update_plan`). Check results come from real exit codes. Edits come from the agent's edit tools. Prose heuristics only fill gaps, and they read your messages and the agent's, never tool output.
+- **Reads the agent's own records.** Plans come from the agent's to-do tools (`TodoWrite`, `update_plan`, `write_todos`). Check results come from real exit codes. Edits come from the agent's edit tools. Prose heuristics only fill gaps, and they read your messages and the agent's, never tool output.
 - **Knows when checks are stale.** A pass followed by more edits is flagged as unverified. `npm test | tail` hides failures behind a 0 exit code, so piped checks are judged by their output.
-- **Picks the right session.** It uses the most recent primary session started in this repo and skips subagent and reviewer threads. If Codex and Claude were both active in the last 10 minutes, it asks which one to use.
+- **Picks the right session.** It uses the most recent primary session started in this repo and skips subagent and reviewer threads. If more than one agent was active in the last 10 minutes, it asks which one to use.
+- **Replays Gemini chats the way Gemini CLI does.** Rewound turns are dropped, and `@file` contents are left out of your prompts.
 - **Redacts secrets at capture.** API keys, tokens, private keys, and credentials in URLs are redacted before anything is saved or copied. `.env` and key files never appear in diffs.
+
+## Supported agents
+
+| Agent | Sessions read from |
+| --- | --- |
+| Codex | `~/.codex/sessions` |
+| Claude Code | `~/.claude/projects` |
+| Gemini CLI | `~/.gemini/tmp/<project>/chats` |
+
+Cursor isn't supported yet.
 
 ## Commands
 
@@ -49,8 +60,8 @@ Paste it into the next agent, or let the agent fetch it over MCP.
 Useful options for `handoff` and `capture`:
 
 ```sh
-ctxpool handoff --from codex           # choose the agent when both were active
-ctxpool handoff --session 01a15320     # a specific session id, or a path to a .jsonl file
+ctxpool handoff --from gemini          # choose the agent when several were active
+ctxpool handoff --session 01a15320     # a specific session id, or a path to a session file
 ctxpool handoff --task billing-flow    # name the task (defaults to the branch or repo)
 ctxpool handoff --budget 1500          # token budget for the transcript excerpt
 ctxpool handoff --no-transcript        # leave the transcript out entirely
@@ -62,6 +73,7 @@ ctxpool handoff --json                 # machine-readable output
 ```sh
 claude mcp add contextpool -- npx -y ctxpool mcp start
 codex mcp add contextpool -- npx -y ctxpool mcp start
+gemini mcp add -s user contextpool npx -y ctxpool mcp start
 ```
 
 All tools are read-only.
@@ -101,6 +113,7 @@ Set `ollama.enabled` (or pass `--ollama`) to have a local Ollama model phrase th
 | `CTXPOOL_HOME` | Store location (default `~/.ctxpool`) |
 | `CODEX_HOME` | Codex data (default `~/.codex`) |
 | `CLAUDE_CONFIG_DIR` | Claude Code data (default `~/.claude`) |
+| `GEMINI_CLI_HOME` | Folder that holds Gemini CLI's `.gemini` directory (default your home folder) |
 | `CTXPOOL_EDITOR` | Editor command for "open file" in the UI |
 | `NO_COLOR` | Plain terminal output |
 

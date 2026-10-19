@@ -137,13 +137,13 @@ export type EngineeringMemory = {
 };
 
 export type AgentSignal = {
-  source: "codex" | "claude" | "unknown";
+  source: SourceAgent | "unknown";
   path: string;
   modifiedAt: string;
   snippets: string[];
 };
 
-export type SourceAgent = "codex" | "claude";
+export type SourceAgent = "codex" | "claude" | "gemini";
 
 export type TranscriptEntry = {
   role: "user" | "assistant" | "tool" | "system";

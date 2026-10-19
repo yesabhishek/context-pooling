@@ -1,6 +1,7 @@
-import { closeSync, existsSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import type { CommandRun, FileEdit, PlanItem, PlanStatus, SourceAgent, SourceSession, TranscriptEntry } from "./types.js";
 import { oneLine, truncate } from "./text.js";
 import { CtxError, canonicalPath, findRecentFiles, unique } from "./util.js";
@@ -42,8 +43,23 @@ export function claudeHome(): string {
   return process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
 }
 
+/** Gemini CLI keeps its data in `.gemini` under GEMINI_CLI_HOME, or under the home directory. */
+export function geminiHome(): string {
+  return join(process.env.GEMINI_CLI_HOME || homedir(), ".gemini");
+}
+
+/** Every agent ContextPool can read, in the order `--from auto` lists them. */
+export const SOURCE_AGENTS: readonly SourceAgent[] = ["codex", "claude", "gemini"];
+
+const SOURCE_LABELS: Record<SourceAgent, string> = { codex: "Codex", claude: "Claude", gemini: "Gemini" };
+
 export function sourceLabel(source: SourceAgent): string {
-  return source === "claude" ? "Claude" : "Codex";
+  return SOURCE_LABELS[source] || source;
+}
+
+/** Where each agent keeps the sessions ContextPool reads. */
+export function sourceSessionDirs(): Record<SourceAgent, string> {
+  return { codex: join(codexHome(), "sessions"), claude: join(claudeHome(), "projects"), gemini: join(geminiHome(), "tmp") };
 }
 
 export function resolveSessionSource(options: ResolveSessionOptions): SourceSession {
@@ -52,16 +68,21 @@ export function resolveSessionSource(options: ResolveSessionOptions): SourceSess
 
   if (options.session) return resolveExplicitSession(from, scope, options.session, options.budget);
 
-  const [first, second] = listSessionCandidates({ ...scope, from }).filter((candidate) => candidate.matchedCwd);
+  const matched = listSessionCandidates({ ...scope, from }).filter((candidate) => candidate.matchedCwd);
+  const [first] = matched;
   if (!first) {
-    const label = from === "auto" ? "Codex or Claude" : sourceLabel(from);
+    const label = from === "auto" ? joinWords(SOURCE_AGENTS.map(sourceLabel), "or") : sourceLabel(from);
     throw new CtxError(`No ${label} session found for ${scope.cwd}.`, "Run `ctxpool sessions --all` to list sessions, then pass --session <id or path>.");
   }
-  if (from === "auto" && second && second.source !== first.source && Date.parse(first.updatedAt) - Date.parse(second.updatedAt) < AMBIGUITY_WINDOW_MS) {
-    throw new CtxError(
-      "Codex and Claude were both active in this workspace in the last 10 minutes.",
-      `Re-run with --from ${first.source} (most recent) or --from ${second.source}.`
-    );
+  if (from === "auto") {
+    const recent = matched.filter((candidate) => Date.parse(first.updatedAt) - Date.parse(candidate.updatedAt) < AMBIGUITY_WINDOW_MS);
+    const active = Array.from(new Set(recent.map((candidate) => candidate.source)));
+    if (active.length > 1) {
+      throw new CtxError(
+        `${joinWords(active.map(sourceLabel), "and")} were ${active.length === 2 ? "both" : "all"} active in this workspace in the last 10 minutes.`,
+        `Re-run with ${joinWords(active.map((source, index) => `--from ${source}${index === 0 ? " (most recent)" : ""}`), "or")}.`
+      );
+    }
   }
   return parseCandidate(first, options.budget);
 }
@@ -70,22 +91,20 @@ export function resolveSessionSource(options: ResolveSessionOptions): SourceSess
 export function listSessionCandidates(options: { cwd: string; repoRoot?: string; from?: SessionFrom; includeSecondary?: boolean }): SessionCandidate[] {
   const scope = toScope(options.cwd, options.repoRoot);
   const from = options.from || "auto";
-  return [
-    ...(from !== "claude" ? findCodexCandidates(scope, options.includeSecondary === true) : []),
-    ...(from !== "codex" ? findClaudeCandidates(scope, options.includeSecondary === true) : [])
-  ].sort(compareCandidates);
+  const sources = from === "auto" ? SOURCE_AGENTS : [from];
+  return sources.flatMap((source) => CANDIDATE_FINDERS[source](scope, options.includeSecondary === true)).sort(compareCandidates);
 }
 
 function normalizeFrom(from: string): SessionFrom {
-  if (from === "auto" || from === "codex" || from === "claude") return from;
-  throw new CtxError(`Unsupported --from value "${from}".`, "Use auto, codex, or claude.");
+  if (from === "auto" || (SOURCE_AGENTS as readonly string[]).includes(from)) return from as SessionFrom;
+  throw new CtxError(`Unsupported --from value "${from}".`, `Use ${joinWords(["auto", ...SOURCE_AGENTS], "or")}.`);
 }
 
 function resolveExplicitSession(from: SessionFrom, scope: Scope, session: string, budget?: number): SourceSession {
   const asPath = resolve(session);
   if (existsSync(asPath) && statSync(asPath).isFile()) {
     const source = from === "auto" ? detectSource(asPath) : from;
-    const parsed = source === "claude" ? parseClaudeSession(asPath, budget) : parseCodexSession(asPath, budget);
+    const parsed = SESSION_PARSERS[source](asPath, budget);
     parsed.matchedCwd = matchesWorkspace(parsed.cwd, scope);
     return parsed;
   }
@@ -93,12 +112,12 @@ function resolveExplicitSession(from: SessionFrom, scope: Scope, session: string
   const match = listSessionCandidates({ ...scope, from, includeSecondary: true }).find(
     (candidate) => candidate.id === session || candidate.id.startsWith(session) || basename(candidate.path).includes(session)
   );
-  if (!match) throw new CtxError(`No session matched "${session}".`, "Pass an id from `ctxpool sessions --all` or a path to a .jsonl file.");
+  if (!match) throw new CtxError(`No session matched "${session}".`, "Pass an id from `ctxpool sessions --all` or a path to a session file.");
   return parseCandidate(match, budget);
 }
 
 function parseCandidate(candidate: SessionCandidate, budget?: number): SourceSession {
-  const session = candidate.source === "codex" ? parseCodexSession(candidate.path, budget) : parseClaudeSession(candidate.path, budget);
+  const session = SESSION_PARSERS[candidate.source](candidate.path, budget);
   session.id = candidate.id || session.id;
   session.cwd = session.cwd || candidate.cwd;
   session.updatedAt = candidate.updatedAt;
@@ -111,6 +130,24 @@ function compareCandidates(a: SessionCandidate, b: SessionCandidate): number {
   if (a.matchedCwd !== b.matchedCwd) return a.matchedCwd ? -1 : 1;
   return Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
 }
+
+/** "a", "a or b", "a, b, or c". */
+function joinWords(words: readonly string[], conjunction: "and" | "or"): string {
+  if (words.length <= 2) return words.join(` ${conjunction} `);
+  return `${words.slice(0, -1).join(", ")}, ${conjunction} ${words.at(-1)}`;
+}
+
+const CANDIDATE_FINDERS: Record<SourceAgent, (scope: Scope, includeSecondary: boolean) => SessionCandidate[]> = {
+  codex: findCodexCandidates,
+  claude: findClaudeCandidates,
+  gemini: findGeminiCandidates
+};
+
+const SESSION_PARSERS: Record<SourceAgent, (path: string, budget?: number) => SourceSession> = {
+  codex: parseCodexSession,
+  claude: parseClaudeSession,
+  gemini: parseGeminiSession
+};
 
 // ---------------------------------------------------------------------------
 // Discovery
@@ -155,6 +192,96 @@ function findClaudeCandidates(scope: Scope, includeSecondary: boolean): SessionC
     });
   }
   return candidates;
+}
+
+/**
+ * Gemini CLI writes one chat per session to tmp/<project>/chats/session-<time>-<id>.jsonl (a single .json file in
+ * older builds). Subagent chats sit in a folder named after the parent session.
+ */
+function findGeminiCandidates(scope: Scope, includeSecondary: boolean): SessionCandidate[] {
+  const tmp = join(geminiHome(), "tmp");
+  const registry = readGeminiProjectRegistry();
+  const byId = new Map<string, SessionCandidate>();
+  for (const project of listDirectories(tmp)) {
+    const chats = join(tmp, project, "chats");
+    const projectRoot = readGeminiProjectRoot(join(tmp, project), registry);
+    for (const path of findRecentFiles(chats, MAX_CANDIDATES, /\.jsonl?$/i)) {
+      const meta = readGeminiMeta(path);
+      if (!meta.id) continue;
+      if ((meta.subagent || dirname(path) !== chats) && !includeSecondary) continue;
+      const cwd = projectRoot || geminiRootFromHash(meta.projectHash, scope);
+      const candidate: SessionCandidate = {
+        source: "gemini",
+        path,
+        id: meta.id,
+        cwd,
+        updatedAt: mtimeIso(path),
+        matchedCwd: matchesWorkspace(cwd, scope),
+        title: meta.title
+      };
+      // Resuming an old .json chat copies it to a .jsonl file beside the original; keep the newer copy.
+      const existing = byId.get(meta.id);
+      if (!existing || Date.parse(candidate.updatedAt) > Date.parse(existing.updatedAt)) byId.set(meta.id, candidate);
+    }
+  }
+  return [...byId.values()];
+}
+
+function readGeminiMeta(path: string): { id?: string; projectHash?: string; subagent: boolean; title?: string } {
+  let metadata: Record<string, unknown> = {};
+  let firstPrompt = "";
+  if (/\.json$/i.test(path)) {
+    const conversation = readGeminiConversation(path);
+    metadata = conversation.metadata;
+    firstPrompt = conversation.messages.map(geminiUserPrompt).find(Boolean) || "";
+  } else {
+    for (const line of readHead(path, 128_000).split(/\r?\n/).slice(0, 60)) {
+      const record = objectValue(parseJson(line));
+      if (typeof record.sessionId === "string" && typeof record.projectHash === "string") metadata = { ...metadata, ...record };
+      else if (!firstPrompt && record.type === "user") firstPrompt = geminiUserPrompt(record);
+    }
+    for (const line of readTail(path, 96_000).split(/\r?\n/)) {
+      if (!line.includes('"summary"')) continue;
+      const summary = stringValue(objectValue(objectValue(parseJson(line)).$set).summary);
+      if (summary) metadata.summary = summary;
+    }
+  }
+  return {
+    id: stringValue(metadata.sessionId) || undefined,
+    projectHash: stringValue(metadata.projectHash) || undefined,
+    subagent: metadata.kind === "subagent",
+    title: stringValue(metadata.summary) || (firstPrompt ? truncate(oneLine(firstPrompt), 80) : undefined)
+  };
+}
+
+/** projects.json maps each project root to the short folder name Gemini uses under tmp/. */
+function readGeminiProjectRegistry(): Map<string, string> {
+  const map = new Map<string, string>();
+  const path = join(geminiHome(), "projects.json");
+  if (!existsSync(path)) return map;
+  for (const [root, name] of Object.entries(objectValue(objectValue(parseJson(readFileSync(path, "utf8"))).projects))) {
+    if (typeof name === "string") map.set(name, root);
+  }
+  return map;
+}
+
+function readGeminiProjectRoot(projectDir: string, registry = readGeminiProjectRegistry()): string | undefined {
+  const marker = join(projectDir, ".project_root");
+  const root = existsSync(marker) ? readFileSync(marker, "utf8").trim() : "";
+  return root || registry.get(basename(projectDir));
+}
+
+/** Older Gemini builds name project folders by the SHA-256 of the project root and leave no marker file. */
+function geminiRootFromHash(projectHash: string | undefined, scope: Scope): string | undefined {
+  if (!projectHash) return undefined;
+  return [scope.cwd, scope.repoRoot].find((root) => root && createHash("sha256").update(root).digest("hex") === projectHash);
+}
+
+/** The tmp/<project> folder that holds a chat file, for main and subagent chats alike. */
+function geminiProjectDir(path: string): string | undefined {
+  let dir = dirname(path);
+  for (let depth = 0; depth < 2; depth++, dir = dirname(dir)) if (basename(dir) === "chats") return dirname(dir);
+  return undefined;
 }
 
 function readCodexMeta(path: string): { id?: string; cwd?: string; secondary: boolean } {
@@ -205,12 +332,26 @@ function readCodexIndex(): Map<string, string> {
 }
 
 function detectSource(path: string): SourceAgent {
+  // Only Gemini writes a whole session as one JSON document.
+  if (/\.json$/i.test(path)) return "gemini";
   for (const line of readHead(path, 64_000).split(/\r?\n/).slice(0, 10)) {
     const record = objectValue(parseJson(line));
     if (record.type === "session_meta" || "payload" in record) return "codex";
+    if ("projectHash" in record || "$set" in record || "$rewindTo" in record) return "gemini";
     if ("sessionId" in record || "message" in record) return "claude";
   }
+  if (path.includes(join(".gemini", "tmp"))) return "gemini";
   return path.includes(`${join(".claude", "projects")}`) ? "claude" : "codex";
+}
+
+function listDirectories(root: string): string[] {
+  try {
+    return readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name);
+  } catch {
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +714,144 @@ function claudeTitle(record: Record<string, unknown>): string | undefined {
   }
 }
 
+export function parseGeminiSession(path: string, budget = DEFAULT_EXCERPT_TOKENS): SourceSession {
+  const { metadata, messages, lineCount } = readGeminiConversation(path);
+  const builder = new SessionBuilder();
+  const id = stringValue(metadata.sessionId) || sessionIdFromPath(path);
+  const projectDir = geminiProjectDir(path);
+
+  for (const message of messages) {
+    const timestamp = stringValue(message.timestamp) || undefined;
+    if (message.type === "user") {
+      builder.message("user", geminiUserPrompt(message), timestamp);
+    } else if (message.type === "gemini") {
+      builder.message("assistant", geminiText(message.content), timestamp);
+      for (const call of Array.isArray(message.toolCalls) ? message.toolCalls.map(objectValue) : []) {
+        readGeminiTool(builder, call, timestamp, projectDir ? join(projectDir, id, "plans") : undefined);
+      }
+    }
+    // info, warning, and error records are CLI notices, not conversation.
+  }
+
+  return buildSession({
+    source: "gemini",
+    id,
+    path,
+    cwd: projectDir ? readGeminiProjectRoot(projectDir) : undefined,
+    lineCount,
+    builder,
+    budget,
+    threadName: stringValue(metadata.summary) || undefined
+  });
+}
+
+/**
+ * Replays a Gemini chat file the way Gemini CLI loads it: a message record is rewritten in place each time its id
+ * repeats, `$set` updates metadata (or replaces every message), and `$rewindTo` drops that message and all after it.
+ */
+function readGeminiConversation(path: string): { metadata: Record<string, unknown>; messages: Record<string, unknown>[]; lineCount: number } {
+  if (/\.json$/i.test(path)) {
+    const record = objectValue(parseJson(readFileSync(path, "utf8")));
+    const messages = Array.isArray(record.messages) ? record.messages.map(objectValue) : [];
+    return { metadata: record, messages, lineCount: messages.length };
+  }
+
+  const lines = readSessionLines(path);
+  const messages = new Map<string, Record<string, unknown>>();
+  const addMessages = (value: unknown) => {
+    for (const message of Array.isArray(value) ? value.map(objectValue) : []) if (typeof message.id === "string") messages.set(message.id, message);
+  };
+  let metadata: Record<string, unknown> = {};
+  for (const line of lines) {
+    const record = objectValue(parseJson(line));
+    if (typeof record.$rewindTo === "string") {
+      const ids = [...messages.keys()];
+      const index = ids.indexOf(record.$rewindTo);
+      for (const messageId of index >= 0 ? ids.slice(index) : ids) messages.delete(messageId);
+    } else if (typeof record.id === "string") {
+      messages.set(record.id, record);
+    } else if (record.$set && typeof record.$set === "object") {
+      const update = objectValue(record.$set);
+      if (Array.isArray(update.messages)) {
+        messages.clear();
+        addMessages(update.messages);
+      }
+      metadata = { ...metadata, ...update };
+    } else if (typeof record.sessionId === "string") {
+      metadata = { ...metadata, ...record };
+      addMessages(record.messages);
+    }
+  }
+  return { metadata, messages: [...messages.values()], lineCount: lines.length };
+}
+
+const GEMINI_REFERENCED_FILES = "--- Content from referenced files ---";
+
+/** What the user typed. `displayContent` holds it when `@file` expansion rewrote `content`; tool results carry no text. */
+function geminiUserPrompt(message: Record<string, unknown>): string {
+  if (message.type !== "user") return "";
+  const text = geminiText(message.displayContent ?? message.content).split(GEMINI_REFERENCED_FILES)[0];
+  return cleanText(text);
+}
+
+function geminiText(value: unknown): string {
+  if (typeof value === "string") return value;
+  const parts = Array.isArray(value) ? value.map(objectValue) : [objectValue(value)];
+  return parts
+    .filter((part) => typeof part.text === "string" && part.thought !== true)
+    .map((part) => part.text as string)
+    .join("");
+}
+
+function readGeminiTool(builder: SessionBuilder, call: Record<string, unknown>, messageTimestamp?: string, plansDir?: string): void {
+  const name = stringValue(call.name);
+  const args = objectValue(call.args);
+  const status = stringValue(call.status);
+  const timestamp = stringValue(call.timestamp) || messageTimestamp;
+
+  switch (name) {
+    case "run_shell_command": {
+      const command = stringValue(args.command);
+      if (status === "cancelled") {
+        builder.toolCall("Shell", `${command} (cancelled)`, timestamp);
+        return;
+      }
+      const output = geminiToolOutput(call);
+      const background = args.is_background === true || output.startsWith("Command moved to background");
+      // The shell tool appends "Exit Code: N" only when N is non-zero.
+      const exitCode = parseExitCode(output) ?? (status === "error" ? 1 : status === "success" && !background ? 0 : undefined);
+      builder.command(command, exitCode, output, timestamp);
+      return;
+    }
+    case "replace":
+    case "write_file":
+      if (status !== "error" && status !== "cancelled") builder.edit(stringValue(args.file_path), timestamp);
+      return;
+    case "write_todos":
+      builder.setPlan(planItemsFrom(args.todos));
+      return;
+    case "exit_plan_mode": {
+      const planFile = plansDir && stringValue(args.plan_filename) ? join(plansDir, basename(stringValue(args.plan_filename))) : "";
+      if (planFile && existsSync(planFile)) builder.planText = cleanText(readFileSync(planFile, "utf8"));
+      return;
+    }
+  }
+  const detail = stringValue(args.file_path) || stringValue(args.dir_path) || stringValue(args.pattern) || stringValue(args.query) || stringValue(args.url) || stringValue(args.description);
+  builder.toolCall(name, detail, timestamp);
+}
+
+/** The text a tool returned to the model. The shell tool prefixes the command's output with "Output: ". */
+function geminiToolOutput(call: Record<string, unknown>): string {
+  const texts = (Array.isArray(call.result) ? call.result.map(objectValue) : [])
+    .flatMap((part) => {
+      const response = objectValue(objectValue(part.functionResponse).response);
+      return [stringValue(response.output), stringValue(response.error), stringValue(part.text)];
+    })
+    .filter(Boolean);
+  const text = texts.length ? texts.join("\n") : stringValue(call.resultDisplay);
+  return text.replace(/^Output: /, "");
+}
+
 function buildSession(args: {
   source: SourceAgent;
   id: string;
@@ -640,6 +919,8 @@ const NOISE_BLOCKS = [
   "plugins_instructions",
   "environment_context",
   "user_instructions",
+  "session_context",
+  "hook_context",
   "INSTRUCTIONS"
 ];
 
@@ -661,7 +942,7 @@ function planItemsFrom(value: unknown): PlanItem[] {
   return value
     .map(objectValue)
     .map((entry) => ({
-      text: oneLine(stringValue(entry.content) || stringValue(entry.step) || stringValue(entry.text) || stringValue(entry.subject)),
+      text: oneLine(stringValue(entry.content) || stringValue(entry.step) || stringValue(entry.text) || stringValue(entry.subject) || stringValue(entry.description)),
       status: planStatus(entry.status)
     }))
     .filter((entry) => entry.text && entry.status !== undefined) as PlanItem[];
@@ -670,7 +951,7 @@ function planItemsFrom(value: unknown): PlanItem[] {
 function planStatus(value: unknown): PlanStatus | undefined {
   if (value === "completed" || value === "done") return "completed";
   if (value === "in_progress" || value === "in-progress" || value === "active") return "in_progress";
-  if (value === "pending" || value === "todo" || value === "not_started") return "pending";
+  if (value === "pending" || value === "todo" || value === "not_started" || value === "blocked") return "pending";
   return undefined;
 }
 

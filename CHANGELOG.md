@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+Gemini CLI joins Codex and Claude as a handoff source. This is the first npm release since 0.1.1, so it also ships everything listed under 0.2.0, including its breaking changes.
+
+### Added
+
+- **Gemini CLI sessions** are a handoff source. ContextPool reads the chat files in `~/.gemini/tmp/<project>/chats`, both the current `.jsonl` format and older `.json` files. It reads your prompts (without `@file` contents), Gemini's replies, shell commands with exit codes, file edits, the `write_todos` plan, and the plan file from `exit_plan_mode`. Rewound turns and subagent chats are skipped. It honors `GEMINI_CLI_HOME`.
+- `--from gemini`, and a Gemini line in `ctxpool status` and the MCP setup help.
+
+### Changed
+
+- **Session selection** asks which agent to use whenever more than one agent was active in the workspace in the last 10 minutes, not just Codex and Claude.
+
 ## 0.2.0
 
 Handoffs now come from what the agent actually did, not from guessing at transcript text.

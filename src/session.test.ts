@@ -1,7 +1,9 @@
+import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { encodeClaudeProjectPath, listSessionCandidates, parseClaudeSession, parseCodexSession, resolveSessionSource } from "./session.js";
-import { claude, codex, isolateEnv, tempDir, writeJsonl } from "./test-helpers.js";
+import { encodeClaudeProjectPath, listSessionCandidates, parseClaudeSession, parseCodexSession, parseGeminiSession, resolveSessionSource } from "./session.js";
+import { claude, codex, gemini, isolateEnv, tempDir, writeJsonl } from "./test-helpers.js";
+import type { CtxError } from "./util.js";
 
 let env: ReturnType<typeof isolateEnv>;
 beforeEach(() => {
@@ -130,6 +132,102 @@ describe("Codex sessions", () => {
   });
 });
 
+describe("Gemini sessions", () => {
+  it("reads prompts, replies, commands, edits, and to-dos", () => {
+    const cwd = tempDir("work");
+    const chats = gemini.project(env.geminiHome, cwd);
+    const todos = [
+      { description: "Add limiter middleware", status: "completed" },
+      { description: "Wire it into the router", status: "in_progress" },
+      { description: "Load test", status: "blocked" },
+      { description: "Old idea", status: "cancelled" }
+    ];
+    const calls = [
+      gemini.tool("w1", "write_todos", { todos }, "Updated todos"),
+      gemini.tool("e1", "replace", { file_path: join(cwd, "src/limit.ts"), old_string: "a", new_string: "b" }, "Edited"),
+      gemini.tool("e2", "write_file", { file_path: join(cwd, "src/rejected.ts"), content: "x" }, "", "cancelled"),
+      gemini.shell("s1", "npm test", 1, "FAIL src/limit.test.ts\n1 failed, 4 passed"),
+      gemini.shell("s2", "npm run lint", 0, "")
+    ];
+    const path = writeJsonl(join(chats, "session-2026-10-19T10-00-g1aaaaaa.jsonl"), [
+      gemini.meta("g1aaaaaa-0000", cwd),
+      gemini.user("env", "<session_context>\nThis is the Gemini CLI. We are setting up the context for our chat.\n</session_context>"),
+      gemini.user("u1", [{ text: "Add rate limiting to the API, see @src/app.ts" }, { text: "\n--- Content from referenced files ---" }, { text: "export const app = 1;" }]),
+      gemini.reply("g1", "I'll add a limiter.", calls.slice(0, 2)),
+      // Gemini CLI rewrites a message in place as its tool calls complete.
+      gemini.reply("g1", "I'll add a limiter.", calls),
+      { $set: { lastUpdated: "2026-10-19T10:02:00.000Z" } },
+      gemini.user("tr", [{ functionResponse: { id: "s1", name: "run_shell_command", response: { output: "Output: 1 failed" } } }]),
+      { id: "i1", timestamp: "2026-10-19T10:02:00.000Z", type: "info", content: "Request cancelled." },
+      gemini.reply("g2", "The limiter is wired in; one test still fails.")
+    ]);
+
+    const session = parseGeminiSession(path);
+    expect(session.source).toBe("gemini");
+    expect(session.id).toBe("g1aaaaaa-0000");
+    expect(session.cwd).toBe(cwd);
+    expect(session.transcript.filter((entry) => entry.role !== "tool").map((entry) => [entry.role, entry.text])).toEqual([
+      ["user", "Add rate limiting to the API, see @src/app.ts"],
+      ["assistant", "I'll add a limiter."],
+      ["assistant", "The limiter is wired in; one test still fails."]
+    ]);
+    expect(session.commands).toMatchObject([
+      { command: "npm test", status: "failed", exitCode: 1 },
+      { command: "npm run lint", status: "passed", exitCode: 0 }
+    ]);
+    expect(session.commands?.[0].errorLine).toContain("FAIL");
+    expect(session.edits?.map((edit) => edit.path)).toEqual([join(cwd, "src/limit.ts")]);
+    expect(session.plan).toEqual([
+      { text: "Add limiter middleware", status: "completed" },
+      { text: "Wire it into the router", status: "in_progress" },
+      { text: "Load test", status: "pending" }
+    ]);
+  });
+
+  it("prefers what the user typed over @file expansions", () => {
+    const cwd = tempDir("work");
+    const path = writeJsonl(join(gemini.project(env.geminiHome, cwd), "session-x.jsonl"), [
+      gemini.meta("g2", cwd),
+      gemini.user("u1", [{ text: "Explain this file\n--- Content from referenced files ---\nbody" }], { displayContent: [{ text: "Explain @README.md" }] })
+    ]);
+    expect(parseGeminiSession(path).transcript.map((entry) => entry.text)).toEqual(["Explain @README.md"]);
+  });
+
+  it("replays rewinds and metadata updates", () => {
+    const cwd = tempDir("work");
+    const path = writeJsonl(join(gemini.project(env.geminiHome, cwd), "session-r.jsonl"), [
+      gemini.meta("g3", cwd),
+      gemini.user("u1", "Add caching."),
+      gemini.reply("g1", "Added an LRU cache."),
+      gemini.user("u2", "Actually use Redis."),
+      gemini.reply("g2", "Switched to Redis."),
+      { $rewindTo: "u2" },
+      gemini.user("u3", "Keep the LRU cache but add a TTL."),
+      { $set: { summary: "LRU cache with TTL" } }
+    ]);
+
+    const session = parseGeminiSession(path);
+    expect(session.threadName).toBe("LRU cache with TTL");
+    expect(session.transcript.map((entry) => entry.text)).toEqual(["Add caching.", "Added an LRU cache.", "Keep the LRU cache but add a TTL."]);
+  });
+
+  it("reads single-file JSON chats from older Gemini CLI builds", () => {
+    const cwd = tempDir("work");
+    const path = join(gemini.project(env.geminiHome, cwd), "session-2026-01-05T09-30-legacy00.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        ...gemini.meta("legacy00-1111", cwd),
+        messages: [gemini.user("u1", "Port the CLI to Bun."), gemini.reply("g1", "Done; tests pass.", [gemini.shell("s1", "bun test", 0, "12 pass")])]
+      })
+    );
+
+    const session = resolveSessionSource({ cwd, session: path });
+    expect(session).toMatchObject({ source: "gemini", id: "legacy00-1111", matchedCwd: true });
+    expect(session.commands).toMatchObject([{ command: "bun test", status: "passed", exitCode: 0 }]);
+  });
+});
+
 describe("session discovery", () => {
   it("skips Codex subagent and reviewer threads", () => {
     const cwd = tempDir("work");
@@ -159,7 +257,7 @@ describe("session discovery", () => {
   it("explains how to recover when no session matches", () => {
     const cwd = tempDir("work");
     writeJsonl(join(env.codexHome, "sessions/a.jsonl"), [codex.meta("elsewhere", tempDir("other"))]);
-    expect(() => resolveSessionSource({ cwd })).toThrowError(/No Codex or Claude session found/);
+    expect(() => resolveSessionSource({ cwd })).toThrowError(/No Codex, Claude, or Gemini session found/);
   });
 
   it("asks which agent to use when both were just active", () => {
@@ -168,6 +266,45 @@ describe("session discovery", () => {
     writeJsonl(join(env.claudeHome, "projects", encodeClaudeProjectPath(cwd), "c.jsonl"), [claude.user(cwd, "Hi there")]);
     expect(() => resolveSessionSource({ cwd })).toThrowError(/both active/);
     expect(resolveSessionSource({ cwd, from: "claude" }).source).toBe("claude");
+  });
+
+  it("finds Gemini sessions by project folder and skips subagent chats", () => {
+    const cwd = tempDir("work");
+    const chats = gemini.project(env.geminiHome, cwd);
+    writeJsonl(join(chats, "session-2026-10-19T10-00-main0000.jsonl"), [gemini.meta("main0000-aaaa", cwd), gemini.user("u1", "Add rate limiting")]);
+    writeJsonl(join(chats, "main0000-aaaa", "sub-1.jsonl"), [gemini.meta("sub-1", cwd, { kind: "subagent" }), gemini.user("u1", "Explore the repo")]);
+    writeJsonl(join(gemini.project(env.geminiHome, tempDir("other"), "other"), "session-x.jsonl"), [gemini.meta("elsewhere", "/elsewhere")]);
+
+    const candidates = listSessionCandidates({ cwd, from: "gemini" });
+    expect(candidates.filter((candidate) => candidate.matchedCwd).map((candidate) => [candidate.id, candidate.title])).toEqual([["main0000-aaaa", "Add rate limiting"]]);
+    expect(candidates.map((candidate) => candidate.id)).not.toContain("sub-1");
+    expect(resolveSessionSource({ cwd }).source).toBe("gemini");
+    expect(resolveSessionSource({ cwd, session: "sub-1" }).id).toBe("sub-1");
+  });
+
+  it("matches hash-named Gemini project folders by project hash", () => {
+    const cwd = realpathSync(tempDir("work"));
+    const chats = join(env.geminiHome, "tmp", "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0", "chats");
+    mkdirSync(chats, { recursive: true });
+    writeFileSync(join(chats, "session-old.json"), JSON.stringify({ ...gemini.meta("hashed", cwd), messages: [gemini.user("u1", "Fix the flaky test")] }));
+    expect(resolveSessionSource({ cwd, from: "gemini" })).toMatchObject({ id: "hashed", cwd, matchedCwd: true });
+  });
+
+  it("asks which agent to use when several were just active", () => {
+    const cwd = tempDir("work");
+    writeJsonl(join(env.codexHome, "sessions/a.jsonl"), [codex.meta("codex-1", cwd)]);
+    writeJsonl(join(env.claudeHome, "projects", encodeClaudeProjectPath(cwd), "c.jsonl"), [claude.user(cwd, "Hi there")]);
+    writeJsonl(join(gemini.project(env.geminiHome, cwd), "session-g.jsonl"), [gemini.meta("gemini-1", cwd)]);
+    const error = (() => {
+      try {
+        resolveSessionSource({ cwd });
+      } catch (caught) {
+        return caught as CtxError;
+      }
+    })();
+    expect(error?.message).toMatch(/^(?:Codex|Claude|Gemini), (?:Codex|Claude|Gemini), and (?:Codex|Claude|Gemini) were all active/);
+    expect(error?.hint).toMatch(/^Re-run with --from \w+ \(most recent\), --from \w+, or --from \w+\.$/);
+    expect(resolveSessionSource({ cwd, from: "gemini" }).id).toBe("gemini-1");
   });
 
   it("resolves an explicit session by path or id prefix", () => {
