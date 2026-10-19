@@ -1,286 +1,186 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { buildAgentContext, buildTeamTimelineExport, renderContextPackOutput } from "./handoff.js";
-import { openStore } from "./store.js";
+import { buildAgentContext, buildTeamTimelineExport } from "./handoff.js";
+import { renderContextPackOutput } from "./pack.js";
+import { openStore, type CtxStore } from "./store.js";
+import { VERSION } from "./version.js";
+
+type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean };
+
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
+
+const INSTRUCTIONS = [
+  "ContextPool holds handoff packets captured from earlier Codex and Claude sessions: the objective, plan, verification results, changed files, and next action.",
+  "When continuing work in a repository, call get_latest_agent_context (or get_handoff_by_task) first and start from its Next action.",
+  "Everything is local and read-only. Secrets are redacted at capture."
+].join(" ");
 
 export async function startMcpServer(): Promise<void> {
-  const server = new McpServer({
-    name: "contextpool",
-    version: "0.1.1"
-  });
+  const server = new McpServer({ name: "contextpool", version: VERSION }, { instructions: INSTRUCTIONS });
 
   server.registerTool(
     "get_latest_handoff",
     {
       title: "Get latest handoff",
-      description: "Return the latest ContextPool handoff packet. Optionally filter by task.",
-      inputSchema: {
-        task: z.string().optional()
-      }
+      description: "Return the most recent handoff as markdown. Optionally filter by task.",
+      inputSchema: { task: z.string().optional() },
+      annotations: READ_ONLY
     },
-    async ({ task }) => {
-      const store = await openStore();
-      try {
+    ({ task }) =>
+      withStore((store) => {
         const handoff = store.getLatestHandoff(task);
-        return {
-          content: [
-            {
-              type: "text",
-              text: handoff?.markdown || "No ContextPool handoff found. Ask the user to run `ctxpool handoff`."
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+        return handoff ? text(handoff.markdown) : notFound(task ? `No handoff found for task "${task}".` : "No handoff found. Ask the user to run `ctxpool handoff`.");
+      })
   );
 
   server.registerTool(
     "get_handoff_by_task",
     {
       title: "Get handoff by task",
-      description: "Return the latest handoff packet for a specific task.",
-      inputSchema: {
-        task: z.string()
-      }
+      description: "Return the latest handoff for a task as markdown.",
+      inputSchema: { task: z.string() },
+      annotations: READ_ONLY
     },
-    async ({ task }) => {
-      const store = await openStore();
-      try {
+    ({ task }) =>
+      withStore((store) => {
         const handoff = store.getLatestHandoff(task);
-        return {
-          content: [
-            {
-              type: "text",
-              text: handoff?.markdown || `No ContextPool handoff found for task "${task}".`
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+        return handoff ? text(handoff.markdown) : notFound(`No handoff found for task "${task}".`);
+      })
   );
 
   server.registerTool(
     "list_tasks",
     {
-      title: "List handoff tasks",
-      description: "List known ContextPool tasks and latest handoff timestamps.",
-      inputSchema: {}
+      title: "List tasks",
+      description: "List tasks with handoffs, newest first, with handoff counts and latest timestamps.",
+      inputSchema: {},
+      annotations: READ_ONLY
     },
-    async () => {
-      const store = await openStore();
-      try {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(store.listTasks(), null, 2)
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+    () => withStore((store) => json(store.listTasks()))
   );
 
   server.registerTool(
     "get_task_status",
     {
       title: "Get task status",
-      description: "Return a concise JSON status summary for the latest handoff of a task.",
-      inputSchema: {
-        task: z.string()
-      }
+      description: "Return a compact JSON status for a task's latest handoff: next action, blockers, and touched files.",
+      inputSchema: { task: z.string() },
+      annotations: READ_ONLY
     },
-    async ({ task }) => {
-      const store = await openStore();
-      try {
+    ({ task }) =>
+      withStore((store) => {
         const latest = store.listHandoffs(task)[0];
-        return {
-          content: [
-            {
-              type: "text",
-              text: latest ? JSON.stringify(latest, null, 2) : `No ContextPool status found for task "${task}".`
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+        return latest ? json(latest) : notFound(`No handoff found for task "${task}".`);
+      })
   );
 
   server.registerTool(
     "get_latest_agent_context",
     {
       title: "Get latest agent context",
-      description: "Return the latest ContextPool handoff as import-ready markdown and structured JSON.",
-      inputSchema: {
-        task: z.string().optional()
-      }
+      description: "Return the latest handoff as import-ready markdown plus a structured summary (plan, verification, changed files). Excludes the raw transcript.",
+      inputSchema: { task: z.string().optional() },
+      annotations: READ_ONLY
     },
-    async ({ task }) => {
-      const store = await openStore();
-      try {
+    ({ task }) =>
+      withStore((store) => {
         const handoff = store.getLatestHandoff(task);
-        if (!handoff) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: task ? `No ContextPool handoff found for task "${task}".` : "No ContextPool handoff found."
-              }
-            ]
-          };
-        }
-        const context = buildAgentContext(handoff);
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(context, null, 2)
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+        if (!handoff) return notFound(task ? `No handoff found for task "${task}".` : "No handoff found.");
+        const { markdown, summary } = buildAgentContext(handoff);
+        return json({ markdown, summary });
+      })
   );
 
   server.registerTool(
     "get_handoff_files",
     {
       title: "Get handoff files",
-      description: "Return structured file changes for the latest handoff of a task.",
-      inputSchema: {
-        task: z.string().optional()
-      }
+      description: "Return the structured file changes (path, status, additions, deletions) from a task's latest handoff.",
+      inputSchema: { task: z.string().optional() },
+      annotations: READ_ONLY
     },
-    async ({ task }) => {
-      const store = await openStore();
-      try {
+    ({ task }) =>
+      withStore((store) => {
         const handoff = store.getLatestHandoff(task);
-        return {
-          content: [
-            {
-              type: "text",
-              text: handoff ? JSON.stringify(handoff.handoffSummary?.fileChanges || [], null, 2) : "[]"
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+        return handoff ? json(handoff.handoffSummary?.fileChanges || []) : notFound("No handoff found.");
+      })
   );
 
   server.registerTool(
     "get_team_timeline_packet",
     {
       title: "Get team timeline packet",
-      description: "Return the latest handoff as a sync-ready team timeline packet with raw transcript excluded by default.",
-      inputSchema: {
-        task: z.string().optional(),
-        includeRawTranscript: z.boolean().optional()
-      }
+      description: "Return the latest handoff as a redacted, sync-ready packet. The raw transcript is excluded unless includeRawTranscript is true.",
+      inputSchema: { task: z.string().optional(), includeRawTranscript: z.boolean().optional() },
+      annotations: READ_ONLY
     },
-    async ({ task, includeRawTranscript }) => {
-      const store = await openStore();
-      try {
+    ({ task, includeRawTranscript }) =>
+      withStore((store) => {
         const handoff = store.getLatestHandoff(task);
-        return {
-          content: [
-            {
-              type: "text",
-              text: handoff ? JSON.stringify(buildTeamTimelineExport(handoff, { includeRawTranscript }), null, 2) : "No ContextPool handoff found."
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+        return handoff ? json(buildTeamTimelineExport(handoff, { includeRawTranscript })) : notFound("No handoff found.");
+      })
   );
 
   server.registerTool(
     "list_context_packs",
     {
       title: "List context packs",
-      description: "List saved ContextPool prompt packs curated from reusable handoff context.",
-      inputSchema: {}
+      description: "List saved context packs: curated, reusable prompt context built in the ContextPool UI.",
+      inputSchema: {},
+      annotations: READ_ONLY
     },
-    async () => {
-      const store = await openStore();
-      try {
-        return {
-          content: [
-            {
-              type: "text",
-              text: JSON.stringify(
-                store.listContextPacks().map((pack) => ({
-                  id: pack.id,
-                  name: pack.name,
-                  updatedAt: pack.updatedAt,
-                  items: pack.items.length,
-                  enabledItems: pack.items.filter((item) => item.enabled).length
-                })),
-                null,
-                2
-              )
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+    () =>
+      withStore((store) =>
+        json(
+          store.listContextPacks().map((pack) => ({
+            id: pack.id,
+            name: pack.name,
+            updatedAt: pack.updatedAt,
+            items: pack.items.length,
+            enabledItems: pack.items.filter((item) => item.enabled).length
+          }))
+        )
+      )
   );
 
   server.registerTool(
     "get_context_pack",
     {
       title: "Get context pack",
-      description: "Return a saved ContextPool prompt pack as import-ready markdown and structured JSON.",
-      inputSchema: {
-        id: z.string(),
-        format: z.enum(["markdown", "json"]).optional()
-      }
+      description: "Return a saved context pack as markdown (default) or JSON.",
+      inputSchema: { id: z.string(), format: z.enum(["markdown", "json"]).optional() },
+      annotations: READ_ONLY
     },
-    async ({ id, format }) => {
-      const store = await openStore();
-      try {
+    ({ id, format }) =>
+      withStore((store) => {
         const pack = store.getContextPackById(id);
-        if (!pack) {
-          return {
-            content: [
-              {
-                type: "text",
-                text: `No ContextPool context pack found for id "${id}".`
-              }
-            ]
-          };
-        }
+        if (!pack) return notFound(`No context pack found with id "${id}".`);
         const output = renderContextPackOutput(pack);
-        return {
-          content: [
-            {
-              type: "text",
-              text: format === "json" ? JSON.stringify(output, null, 2) : output.markdown
-            }
-          ]
-        };
-      } finally {
-        store.close();
-      }
-    }
+        return format === "json" ? json(output.json) : text(output.markdown);
+      })
   );
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  await server.connect(new StdioServerTransport());
+}
+
+async function withStore(fn: (store: CtxStore) => ToolResult): Promise<ToolResult> {
+  const store = await openStore();
+  try {
+    return fn(store);
+  } finally {
+    store.close();
+  }
+}
+
+function text(value: string): ToolResult {
+  return { content: [{ type: "text", text: value }] };
+}
+
+function json(value: unknown): ToolResult {
+  return text(JSON.stringify(value, null, 2));
+}
+
+function notFound(message: string): ToolResult {
+  return { content: [{ type: "text", text: message }], isError: true };
 }

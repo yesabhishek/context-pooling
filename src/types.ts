@@ -31,14 +31,38 @@ export type FileChange = {
   diff?: string;
 };
 
-export type WorkPhase = "planning" | "implementation" | "debugging" | "verification" | "blocked" | "handoff";
+export type WorkPhase = "planning" | "implementation" | "debugging" | "verification" | "review" | "blocked" | "handoff";
 
 export type VerificationStatus = "passed" | "failed" | "unknown";
 
 export type VerificationCommand = {
   command: string;
   status: VerificationStatus;
+  exitCode?: number;
   evidence?: string;
+};
+
+export type PlanStatus = "pending" | "in_progress" | "completed";
+
+export type PlanItem = {
+  text: string;
+  status: PlanStatus;
+};
+
+/** A shell command the agent ran, with its real exit status when the log records one. */
+export type CommandRun = {
+  command: string;
+  status: VerificationStatus;
+  exitCode?: number;
+  /** First meaningful error line from a failed run. */
+  errorLine?: string;
+  /** Position in the session event stream, used to order runs against edits. */
+  seq: number;
+};
+
+export type FileEdit = {
+  path: string;
+  seq: number;
 };
 
 export type VerificationSummary = {
@@ -96,10 +120,11 @@ export type TeamSyncPolicy = {
 export type EngineeringMemory = {
   version: 1;
   identity: StableIdentity;
-  positioning: {
-    category: "handoff-ledger";
-    buyer: "ai-heavy-engineering-teams";
-    moat: "provenance-backed-engineering-memory";
+  /** Present on packets captured before v0.2; no longer written. */
+  positioning?: {
+    category: string;
+    buyer: string;
+    moat: string;
   };
   intent: MemoryFact[];
   decisions: MemoryFact[];
@@ -139,6 +164,15 @@ export type SourceSession = {
   transcriptExcerpt: string;
   threadName?: string;
   supplementalPaths?: string[];
+  /** Latest structured plan the agent maintained (TodoWrite, update_plan, task tools). */
+  plan?: PlanItem[];
+  /** Latest plan the agent proposed in prose (ExitPlanMode, plan mode). */
+  planText?: string;
+  commands?: CommandRun[];
+  edits?: FileEdit[];
+  /** Summary the agent wrote when it compacted earlier context. */
+  compactSummary?: string;
+  links?: string[];
 };
 
 export type HandoffSections = {
@@ -175,6 +209,9 @@ export type HandoffContinuitySummary = {
   commandsRun: string[];
   errors: string[];
   decisions: string[];
+  plan?: PlanItem[];
+  constraints?: string[];
+  title?: string;
   sourceSession?: {
     source: SourceAgent;
     id: string;
@@ -204,6 +241,8 @@ export type HandoffPacket = {
   engineeringMemory?: EngineeringMemory;
   markdown: string;
   markdownPath: string;
+  /** Estimated tokens in `markdown`. */
+  tokenEstimate?: number;
 };
 
 export type HandoffSummary = {
@@ -270,9 +309,11 @@ export type ContextPackOutput = {
     updatedAt: string;
     includeRawTranscript: boolean;
     estimatedChars: number;
+    estimatedTokens: number;
     warnings: string[];
     items: ContextPackItem[];
   };
   estimatedChars: number;
+  estimatedTokens: number;
   warnings: string[];
 };

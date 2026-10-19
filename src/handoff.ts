@@ -1,11 +1,9 @@
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import type {
   AgentSignal,
+  CommandRun,
   ContextBlock,
-  ContextPack,
-  ContextPackItem,
-  ContextPackOutput,
   ContextSignal,
   EngineeringMemory,
   FileChange,
@@ -14,16 +12,23 @@ import type {
   HandoffPacket,
   HandoffSections,
   MemoryFact,
+  PlanItem,
   ProvenanceKind,
   SourceSession,
+  VerificationCommand,
   VerificationSummary,
-  VerificationStatus,
   WorkPhase
 } from "./types.js";
 import { ensureCtxDirs } from "./paths.js";
+import { redactDeep, redactSecrets } from "./redact.js";
 import { captureGitSnapshot, inferTaskName } from "./repo.js";
-import { resolveSessionSource, type SessionFrom } from "./session.js";
-import { hashText, limit, slugify, unique } from "./util.js";
+import { resolveSessionSource, sourceLabel, type SessionFrom } from "./session.js";
+import { estimateTokens, oneLine, truncate } from "./text.js";
+import { canonicalPath, hashText, limit, slugify, unique } from "./util.js";
+import { isVerificationCommand, verificationKey, verificationLabel } from "./verify.js";
+import { VERSION } from "./version.js";
+
+export { createContextPack, normalizeContextPack, renderContextPackOutput } from "./pack.js";
 
 export type CreateHandoffOptions = {
   cwd?: string;
@@ -32,280 +37,162 @@ export type CreateHandoffOptions = {
   from?: SessionFrom;
   session?: string;
   includeTranscript?: boolean;
+  /** Token budget for the transcript excerpt. */
   budget?: number;
   useOllama?: boolean;
+  ollamaModel?: string;
 };
 
+// Agents narrate obstacles they then work around; only their latest messages describe the current state.
+const BLOCKER_WINDOW = 2;
+const TODO_WINDOW = 4;
+
 export async function createHandoff(options: CreateHandoffOptions = {}): Promise<HandoffPacket> {
-  const cwd = options.cwd || process.cwd();
+  const cwd = resolve(options.cwd || process.cwd());
   const paths = ensureCtxDirs();
   const repo = captureGitSnapshot(cwd);
   const task = inferTaskName(options.task, repo);
-  const sourceSession = resolveSessionSource({
-    from: options.from || "auto",
-    cwd,
-    session: options.session,
-    budget: options.budget
-  });
-  const sources = sourceSessionToSignals(sourceSession);
+  const sourceSession = withRepoRelativeEdits(
+    redactDeep(
+      resolveSessionSource({
+        from: options.from || "auto",
+        cwd,
+        repoRoot: repo.isGitRepo ? repo.repoPath : undefined,
+        session: options.session,
+        budget: options.budget
+      })
+    ),
+    repo.repoPath
+  );
   const sections = buildSections(task, repo.dirtyFiles, repo.diffStat, sourceSession);
   const handoffSummary = buildHandoffSummary(task, repo, sourceSession, sections);
   const createdAt = new Date().toISOString();
   const id = `${createdAt.replace(/[:.]/g, "-")}-${hashText(`${task}:${createdAt}`)}`;
 
-  if (options.useOllama !== false) {
-    const improved = await improveWithOllama(task, sections).catch(() => undefined);
+  if (options.useOllama) {
+    const improved = await suggestNextActionWithOllama(task, handoffSummary, options.ollamaModel).catch(() => undefined);
     if (improved) {
       sections.nextBestAction = improved;
       handoffSummary.nextAction = improved;
     }
   }
 
-  const engineeringMemory = buildEngineeringMemory(task, repo, sourceSession, id, handoffSummary);
-
-  const markdown = renderHandoffMarkdown({
+  const packet: HandoffPacket = {
     id,
     task,
     createdAt,
     targetAgent: options.to,
     repo,
-    sources,
+    sources: [{ source: sourceSession.source, path: sourceSession.path, modifiedAt: sourceSession.updatedAt, snippets: [] }],
     sourceSession,
     sections,
     handoffSummary,
-    engineeringMemory,
+    engineeringMemory: buildEngineeringMemory(task, repo, sourceSession, id, handoffSummary),
     markdown: "",
     markdownPath: ""
-  }, options.includeTranscript !== false);
+  };
+  packet.markdown = renderHandoffMarkdown(packet, options.includeTranscript !== false);
+  packet.tokenEstimate = estimateTokens(packet.markdown);
 
   const taskDir = join(paths.handoffsDir, slugify(task));
   mkdirSync(taskDir, { recursive: true });
-  const markdownPath = join(taskDir, `${createdAt.replace(/[:.]/g, "-")}.md`);
-  writeFileSync(markdownPath, markdown, "utf8");
-
-  return {
-    id,
-    task,
-    createdAt,
-    targetAgent: options.to,
-    repo,
-    sources,
-    sourceSession,
-    sections,
-    handoffSummary,
-    engineeringMemory,
-    markdown,
-    markdownPath
-  };
+  packet.markdownPath = join(taskDir, `${createdAt.replace(/[:.]/g, "-")}.md`);
+  writeFileSync(packet.markdownPath, packet.markdown, { encoding: "utf8", mode: 0o600 });
+  return packet;
 }
 
+// ---------------------------------------------------------------------------
+// Extraction
+
+/**
+ * Pull the working state out of a session. Structured agent data (plans, command exit codes, edits)
+ * wins; prose heuristics fill gaps and only read the user's and the agent's own words, never tool output.
+ */
 export function buildSections(task: string, filesTouched: string[], diffStat: string, sourceSessionOrSources: SourceSession | AgentSignal[]): HandoffSections {
-  const sourceSession = Array.isArray(sourceSessionOrSources) ? undefined : sourceSessionOrSources;
-  const sources = Array.isArray(sourceSessionOrSources) ? sourceSessionOrSources : sourceSessionToSignals(sourceSessionOrSources);
-  const messageSnippets = sourceSession
-    ? sourceSession.transcript.filter((entry) => entry.role !== "tool").flatMap((entry) => segmentText(entry.text)).map(toHandoffSignal).filter(Boolean)
-    : sources.flatMap((source) => source.snippets);
-  const toolSnippets = sourceSession
-    ? sourceSession.transcript.filter((entry) => entry.role === "tool").flatMap((entry) => segmentText(entry.text)).map(toHandoffSignal).filter(Boolean)
-    : [];
-  const operationalSnippets = [...messageSnippets, ...toolSnippets];
-  const completed = match(messageSnippets, /(done|completed|fixed|implemented|added|created|updated|changed)/i, 8);
-  const todos = match(messageSnippets, /(todo|need to|remaining|follow.?up|please implement|implement this plan|make sure|fix\b|add\b|replace\b|update\b|continue\b)/i, 10);
-  const blockers = match(messageSnippets, /(blocked|blocker|stuck|missing|cannot|can't|failed because|error|failure)/i, 8);
-  const errors = match(operationalSnippets, /(error|failed|failure|exception|traceback|test failed|build failed)/i, 8);
-  const decisions = match(messageSnippets, /(decision|decided|use |prefer |do not|don't|avoid)/i, 8);
-  const commandsRun = match(toolSnippets, /\b(npm|pnpm|yarn|bun|git|node|tsx|tsc|vitest|pytest|cargo|go test)\b/i, 12);
-  const transcriptFiles = extractFilePaths(messageSnippets);
-  const mergedFilesTouched = limit(unique([...filesTouched, ...transcriptFiles]), 40);
-  const next = todos[0] || blockers[0] || "Review the changed files, run the relevant tests, and continue from the current git diff.";
+  const session = Array.isArray(sourceSessionOrSources) ? undefined : sourceSessionOrSources;
+  const legacySnippets = Array.isArray(sourceSessionOrSources) ? sourceSessionOrSources.flatMap((source) => source.snippets) : [];
+
+  const userMessages = session ? session.transcript.filter((entry) => entry.role === "user").map((entry) => entry.text) : [];
+  const assistantMessages = session ? session.transcript.filter((entry) => entry.role === "assistant").map((entry) => entry.text) : [];
+  const allProse = session ? assistantMessages.flatMap(sentences) : legacySnippets.flatMap(sentences);
+  const recent = (count: number) => (session ? assistantMessages.slice(-count).flatMap(sentences) : allProse);
+
+  const plan = session?.plan;
+  const completed = plan ? plan.filter((item) => item.status === "completed").map((item) => item.text) : pick(allProse, COMPLETED, 8);
+  const inProgress = plan ? plan.filter((item) => item.status === "in_progress").map((item) => item.text) : [];
+  const todos = plan ? plan.filter((item) => item.status !== "completed").map((item) => item.text) : pick(recent(TODO_WINDOW), TODO, 10);
+  const blockers = pick(recent(BLOCKER_WINDOW), BLOCKER, 6);
+  const verification = summarizeVerification(session, legacySnippets);
+  const errors = session
+    ? verification.commands.filter((command) => command.status === "failed").map((command) => `\`${command.command}\` failed${command.evidence ? `: ${command.evidence}` : ""}`)
+    : pick(legacySnippets, /\b(error|failed|failure|exception|traceback)\b/i, 8);
+  const commandsRun = session ? limit((session.commands || []).map((run) => run.command), 20) : pick(legacySnippets, SHELL_TOOL, 12);
+  const editedFiles = (session?.edits || []).map((edit) => edit.path);
+  const mentionedFiles = session ? [] : extractFilePaths(legacySnippets);
+  const decisions = pick(allProse, DECISION, 8);
+  // The first and latest requests are rendered in full, so constraints come from the messages in between.
+  const constraints = limit([...userMessages.slice(1, -1).flatMap(sentences).filter((sentence) => CONSTRAINT.test(sentence)), ...pick(allProse, DEAD_END, 4)], 8);
+  const changedFiles = limit([...filesTouched, ...editedFiles, ...mentionedFiles], 40);
 
   return {
-    goal: `Continue the ${task} task without re-discovering prior context.`,
-    currentStatus: limit(
-      [
-        filesTouched.length > 0 ? `${filesTouched.length} dirty file(s) are present in the working tree.` : "No dirty files were detected in the working tree.",
-        diffStat ? `Current diff summary: ${diffStat.split("\n").join("; ")}` : "No diff stat is available.",
-        sourceSession
-          ? `Exported ${sourceSession.transcript.length} transcript item(s) from ${sourceSession.source} session ${sourceSession.id}.`
-          : sources.length > 0 ? `Imported signals from ${sources.length} recent agent log file(s).` : "No recent Codex or Claude log signals were found."
-      ],
-      6
-    ),
+    goal: `Continue the ${task} task.`,
+    currentStatus: [
+      changedFiles.length ? `${changedFiles.length} changed file(s)${diffStat ? ` (${diffStat})` : ""}.` : "Working tree is clean.",
+      `Verification: ${verification.status}.`
+    ],
     completed,
-    inProgress: limit([...todos.slice(0, 4), ...mergedFilesTouched.slice(0, 6).map((file) => `Work appears active around ${file}.`)], 8),
+    inProgress,
     todos,
     blockers,
-    filesTouched: mergedFilesTouched,
+    filesTouched: changedFiles,
     commandsRun,
     errors,
     decisions,
-    doNotRepeat: match(messageSnippets, /(do not|don't|avoid|never|not repeat|already tried)/i, 8),
-    nextBestAction: next
+    doNotRepeat: constraints,
+    nextBestAction: chooseNextAction({
+      verification,
+      blockers,
+      plan,
+      todos,
+      changedFileCount: changedFiles.length,
+      latestUserMessage: userMessages.at(-1)
+    })
   };
-}
-
-export function renderHandoffMarkdown(packet: Omit<HandoffPacket, "markdownPath"> & { markdownPath: string }, includeTranscript = true): string {
-  const normalized = normalizeHandoffPacket(packet);
-  const summary = normalized.handoffSummary;
-  const sourceLines = packet.sources.map((source) => `- ${source.source}: ${source.path} (${source.modifiedAt})`);
-  const session = packet.sourceSession;
-  return [
-    `# Handoff: ${packet.task}`,
-    "",
-    `Generated: ${packet.createdAt}`,
-    packet.targetAgent ? `Target agent: ${packet.targetAgent}` : "",
-    "",
-    "## Original Question",
-    summary?.originalQuestion || "Not captured.",
-    "",
-    "## Latest User Instruction",
-    summary?.latestUserInstruction || "Not captured.",
-    "",
-    "## Current State",
-    summary ? renderCurrentState(summary) : "Not captured.",
-    "",
-    "## AI Plan",
-    summary?.agentPlan || "Not captured.",
-    "",
-    "## Goal",
-    packet.sections.goal,
-    "",
-    "## What Changed",
-    list(formatFileChanges(summary?.fileChanges || [])),
-    "",
-    "## Current Status",
-    list(packet.sections.currentStatus),
-    "",
-    "## Completed",
-    list(packet.sections.completed),
-    "",
-    "## In Progress",
-    list(packet.sections.inProgress),
-    "",
-    "## Leftover Work",
-    list(summary?.remainingWork || packet.sections.todos),
-    "",
-    "## Blockers",
-    list(packet.sections.blockers),
-    "",
-    "## Files Touched",
-    list(packet.sections.filesTouched),
-    "",
-    "## Commands Run",
-    list(packet.sections.commandsRun),
-    "",
-    "## Verification",
-    summary ? renderVerification(summary.verification) : "- Unknown.",
-    "",
-    "## Errors and Test Failures",
-    list(packet.sections.errors),
-    "",
-    "## Important Decisions",
-    list(packet.sections.decisions),
-    "",
-    "## Do Not Repeat",
-    list(packet.sections.doNotRepeat),
-    "",
-    "## Engineering Memory",
-    normalized.engineeringMemory ? renderEngineeringMemory(normalized.engineeringMemory) : "- Not captured.",
-    "",
-    "## Next Best Action",
-    summary?.nextAction || packet.sections.nextBestAction,
-    "",
-    "## Source Session",
-    ...(session
-      ? [
-          `- Agent: ${session.source}`,
-          `- Session ID: ${session.id}`,
-          `- Session path: ${session.path}`,
-          `- Session cwd: ${session.cwd || "unknown"}`,
-          `- Matched cwd: ${session.matchedCwd ? "yes" : "no"}`,
-          `- Updated: ${session.updatedAt}`,
-          `- Transcript items: ${session.transcript.length}`,
-          `- Session lines: ${session.lineCount}`,
-          ...(session.threadName ? [`- Thread: ${session.threadName}`] : []),
-          ...(session.supplementalPaths?.length ? [`- Supplemental paths: ${session.supplementalPaths.join(", ")}`] : [])
-        ]
-      : sourceLines.length ? sourceLines : ["- None captured."]),
-    "",
-    ...(includeTranscript
-      ? [
-          "## Exported Transcript Excerpt",
-          session?.transcriptExcerpt || "No transcript excerpt captured.",
-          ""
-        ]
-      : []),
-    "",
-    "## Source Provenance",
-    `- Repo: ${packet.repo.repoPath}`,
-    `- Branch: ${packet.repo.branch}`,
-    `- Commit: ${packet.repo.commit}`,
-    `- Git repo: ${packet.repo.isGitRepo ? "yes" : "no"}`,
-    ...sourceLines,
-    ""
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
-}
-
-export function normalizeHandoffPacket(packet: HandoffPacket): HandoffPacket {
-  const repo = {
-    ...packet.repo,
-    fileChanges: packet.repo.fileChanges?.length ? packet.repo.fileChanges : legacyFileChanges(packet.repo.dirtyFiles || [])
-  };
-  const derivedSummary = buildHandoffSummary(packet.task, repo, packet.sourceSession, packet.sections);
-  const existingSummary = packet.handoffSummary;
-  const handoffSummary = existingSummary
-    ? {
-        ...derivedSummary,
-        ...existingSummary,
-        fileChanges: existingSummary.fileChanges?.length ? existingSummary.fileChanges : derivedSummary.fileChanges,
-        verification: existingSummary.verification || derivedSummary.verification,
-        repoStats: existingSummary.repoStats || derivedSummary.repoStats,
-        contextSignals: existingSummary.contextSignals?.length ? existingSummary.contextSignals : derivedSummary.contextSignals,
-        sourceSession: existingSummary.sourceSession || derivedSummary.sourceSession,
-        repo: existingSummary.repo || derivedSummary.repo
-      }
-    : derivedSummary;
-  const engineeringMemory = packet.engineeringMemory || buildEngineeringMemory(packet.task, repo, packet.sourceSession, packet.id, handoffSummary);
-  return { ...packet, repo, handoffSummary, engineeringMemory };
 }
 
 export function buildHandoffSummary(task: string, repo: GitSnapshot, sourceSession: SourceSession | undefined, sections: HandoffSections): HandoffContinuitySummary {
   const fileChanges = repo.fileChanges?.length ? repo.fileChanges : legacyFileChanges(repo.dirtyFiles || []);
-  const originalQuestion = sourceSession ? firstUsefulUserMessage(sourceSession) : "";
-  const latestUserInstruction = sourceSession ? latestUsefulUserMessage(sourceSession) : "";
-  const latestAssistantSummary = sourceSession ? latestAssistantMessage(sourceSession) : "";
-  const agentPlan = sourceSession ? latestPlanMessage(sourceSession) : "";
-  const verification = inferVerification(sections, sourceSession);
-  const repoStats = summarizeRepoStats(fileChanges);
-  const remainingWork = meaningfulList(sections.todos, [
-    "No explicit leftover work was captured. Review the changed files and run the relevant tests."
-  ]);
-  const inProgressWork = meaningfulList(
-    sections.inProgress.filter((item) => !/^Work appears active around /i.test(item)),
-    fileChanges.length ? [`Active work is concentrated in ${fileChanges.length} changed file(s).`] : []
-  );
+  const userMessages = sourceSession?.transcript.filter((entry) => entry.role === "user").map((entry) => entry.text) || [];
+  const assistantMessages = sourceSession?.transcript.filter((entry) => entry.role === "assistant").map((entry) => entry.text) || [];
+  const verification = summarizeVerification(sourceSession, sections.commandsRun);
+  const plan = sourceSession?.plan;
+  const agentPlan = sourceSession?.planText || (plan ? plan.map(formatPlanItem).join("\n") : latestPlanMessage(assistantMessages));
+  const originalQuestion = truncate(userMessages[0] || "", 1_500);
+  const latestUserInstruction = truncate(userMessages.at(-1) || "", 1_500);
+  const latestAssistantSummary = truncate(assistantMessages.at(-1) || "", 1_500);
 
   return {
     version: 1,
+    title: sourceSession?.threadName,
     originalQuestion: originalQuestion || `Continue the ${task} task.`,
     latestUserInstruction: latestUserInstruction || originalQuestion || `Continue the ${task} task.`,
-    latestAssistantSummary: latestAssistantSummary || "No assistant progress summary was captured.",
-    agentPlan: agentPlan || "No explicit AI plan was captured in the source session.",
-    workPhase: inferWorkPhase(sections, verification, agentPlan, fileChanges),
+    latestAssistantSummary,
+    agentPlan,
+    workPhase: inferWorkPhase(sections, verification, plan, agentPlan, fileChanges),
     verification,
-    repoStats,
+    repoStats: summarizeRepoStats(fileChanges),
     contextSignals: buildContextSignals(sections, latestUserInstruction || originalQuestion, latestAssistantSummary),
-    completedWork: meaningfulList(sections.completed, []),
-    inProgressWork,
-    remainingWork,
+    completedWork: sections.completed,
+    inProgressWork: sections.inProgress,
+    remainingWork: sections.todos,
     blockers: sections.blockers,
     nextAction: sections.nextBestAction,
     fileChanges,
     commandsRun: sections.commandsRun,
     errors: sections.errors,
     decisions: sections.decisions,
+    constraints: sections.doNotRepeat,
+    plan,
     sourceSession: sourceSession
       ? {
           source: sourceSession.source,
@@ -325,320 +212,110 @@ export function buildHandoffSummary(task: string, repo: GitSnapshot, sourceSessi
   };
 }
 
-export function renderAgentContextMarkdown(packet: HandoffPacket): string {
-  const normalized = normalizeHandoffPacket(packet);
-  const summary = normalized.handoffSummary;
-  return [
-    `# ContextPool Agent Handoff: ${normalized.task}`,
-    "",
-    `Generated: ${normalized.createdAt}`,
-    `Repo: ${summary?.repo.repoPath || normalized.repo.repoPath}`,
-    `Branch/commit: ${normalized.repo.branch}@${normalized.repo.commit}`,
-    "",
-    "## Original Question",
-    summary?.originalQuestion || "Not captured.",
-    "",
-    "## Latest User Instruction",
-    summary?.latestUserInstruction || "Not captured.",
-    "",
-    "## Current State",
-    summary ? renderCurrentState(summary) : "Not captured.",
-    "",
-    "## AI Plan",
-    summary?.agentPlan || "Not captured.",
-    "",
-    "## Completed",
-    list(summary?.completedWork || []),
-    "",
-    "## In Progress",
-    list(summary?.inProgressWork || []),
-    "",
-    "## Leftover Work",
-    list(summary?.remainingWork || []),
-    "",
-    "## Verification",
-    summary ? renderVerification(summary.verification) : "- Unknown.",
-    "",
-    "## Blockers",
-    list(summary?.blockers || []),
-    "",
-    "## Files Changed",
-    list(formatFileChanges(summary?.fileChanges || [])),
-    "",
-    "## Commands Run",
-    list(summary?.commandsRun || []),
-    "",
-    "## Errors",
-    list(summary?.errors || []),
-    "",
-    "## Engineering Memory",
-    normalized.engineeringMemory ? renderEngineeringMemory(normalized.engineeringMemory) : "- Not captured.",
-    "",
-    "## Next Action",
-    summary?.nextAction || normalized.sections.nextBestAction
-  ].join("\n");
+const COMPLETED = /^(?:done|completed|fixed|implemented|added|created|updated|refactored|removed|shipped|wrote)\b|\b(?:i(?:'ve| have)|we(?:'ve| have)|now)\s+(?:added|fixed|implemented|updated|created|removed|refactored|wired)\b/i;
+const TODO = /\b(?:todo|still need(?:s)? to|left to do|not yet (?:done|implemented|handled)|remaining(?: work)?:|follow[- ]?up:|next step)/i;
+const BLOCKER =
+  /\b(?:blocked|blocker|stuck|cannot proceed|can't proceed|unable to (?:proceed|continue)|waiting (?:on|for) (?:you|the user|approval|access)|need(?:s)? (?:your|user) (?:input|approval|confirmation)|permission denied|is missing|not configured|missing (?:credentials|access|env))\b/i;
+const DECISION = /^(?:decision|decided)\b|\b(?:decided to|chose to|opted to|going with|we(?:'ll| will) use|i(?:'ll| will) use|instead of)\b/i;
+const CONSTRAINT = /\b(?:don't|do not|never|always|must(?! have)|should not|shouldn't|avoid|make sure|only use|without)\b/i;
+const DEAD_END = /\b(?:already tried|didn't work|doesn't work|did not work|reverted|rolled back)\b/i;
+const SHELL_TOOL = /\b(npm|pnpm|yarn|bun|git|node|tsx|tsc|vitest|pytest|cargo|go test)\b/i;
+
+function pick(snippets: string[], pattern: RegExp, count: number): string[] {
+  return limit(snippets.filter((snippet) => pattern.test(snippet)).reverse().map((snippet) => truncate(snippet, 300)), count);
 }
 
-export function buildAgentContext(packet: HandoffPacket): { markdown: string; summary: HandoffContinuitySummary; engineeringMemory: EngineeringMemory; packet: HandoffPacket } {
-  const normalized = normalizeHandoffPacket(packet);
-  return {
-    markdown: renderAgentContextMarkdown(normalized),
-    summary: normalized.handoffSummary!,
-    engineeringMemory: normalized.engineeringMemory!,
-    packet: normalized
-  };
+function sentences(text: string): string[] {
+  return text
+    .split(/\n+|(?<=[.!?])\s+(?=[A-Z0-9`*])/)
+    .map((part) => part.replace(/^[-*>\d.)\s]+/, "").replace(/\*\*/g, "").trim())
+    .filter((part) => part.length > 8 && part.length < 600 && !/^```/.test(part));
 }
 
-export function deriveContextBlocks(packet: HandoffPacket): ContextBlock[] {
-  const normalized = normalizeHandoffPacket(packet);
-  const summary = normalized.handoffSummary!;
-  const memory = normalized.engineeringMemory!;
-  const source = `${summary.sourceSession?.source || "handoff"}:${summary.sourceSession?.id || normalized.id}`;
-  const blocks: ContextBlock[] = [];
-  const push = (
-    category: ContextBlock["category"],
-    title: string,
-    text: string,
-    provenance: ProvenanceKind,
-    confidence: "high" | "medium" | "low",
-    provenanceSource = source
-  ) => {
-    const clean = cleanContextText(text);
-    if (!clean || /^None captured\.?$/i.test(clean) || /^Not captured\.?$/i.test(clean)) return;
-    blocks.push({
-      id: stableId(`${normalized.id}:${category}`, `${title}:${clean}`),
-      sourceHandoffId: normalized.id,
-      sourceTask: normalized.task,
-      sourceCreatedAt: normalized.createdAt,
-      category,
-      title,
-      text: clean,
-      provenance: { kind: provenance, confidence, source: provenanceSource },
-      estimatedChars: clean.length
-    });
-  };
+function chooseNextAction(input: {
+  verification: VerificationSummary;
+  blockers: string[];
+  plan?: PlanItem[];
+  todos: string[];
+  changedFileCount: number;
+  latestUserMessage?: string;
+}): string {
+  const failed = input.verification.commands.find((command) => command.status === "failed");
+  if (failed) return `Fix the failing \`${failed.command}\`${failed.evidence ? ` (${failed.evidence})` : ""}, then re-run it.`;
+  if (input.blockers[0]) return `Resolve the blocker: ${input.blockers[0]}`;
 
-  push("intent", "Original question", summary.originalQuestion, "user-authored", "high");
-  push("instruction", "Latest user instruction", summary.latestUserInstruction, "user-authored", "high");
-  push("next-action", "Next action", summary.nextAction, "ai-inferred", "medium");
-  for (const fact of memory.decisions) push("decision", "Decision", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
-  for (const fact of memory.constraints) push("constraint", "Constraint", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
-  for (const fact of memory.verification) push("verification", "Verification", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
-  for (const fact of memory.risks) push("risk", "Risk", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
-  for (const fact of memory.nextActions.slice(1)) push("next-action", "Remaining work", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
-  for (const fact of memory.changedFiles) push("changed-file", "Changed file", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
+  const active = input.plan?.find((item) => item.status === "in_progress");
+  if (active) return `Continue: ${active.text}`;
+  const pending = input.plan?.find((item) => item.status === "pending");
+  if (pending) return `Next: ${pending.text}`;
 
-  for (const entry of normalized.sourceSession?.transcript || []) {
-    if (entry.role === "tool") continue;
-    const text = cleanContextText(entry.text);
-    if (!text || text.length < 20) continue;
-    push("transcript", `${labelize(entry.role)} transcript`, text, "transcript-derived", "medium", source);
+  const unverified = input.verification.gaps.some((gap) => /edited after|No tests/.test(gap));
+  if (input.changedFileCount && unverified) {
+    const checks = unique(input.verification.commands.map((command) => `\`${command.command}\``)).slice(-2);
+    return `Verify the ${input.changedFileCount} changed file(s) with ${checks.length ? checks.join(" and ") : "the project's tests and type checks"}.`;
   }
-
-  return dedupeBlocks(blocks).slice(0, 160);
+  if (input.todos[0]) return input.todos[0];
+  if (input.latestUserMessage) return `Confirm the latest request is fully handled: “${truncate(oneLine(input.latestUserMessage), 160)}”`;
+  return "Review the current diff and continue the task.";
 }
 
-export function createContextPack(name: string, blocks: ContextBlock[] = [], options: { includeRawTranscript?: boolean } = {}): ContextPack {
-  const now = new Date().toISOString();
-  const id = `pack_${hashText(`${name}:${now}`)}`;
-  return {
-    id,
-    name: name.trim() || "Untitled context pack",
-    createdAt: now,
-    updatedAt: now,
-    includeRawTranscript: options.includeRawTranscript === true,
-    items: blocks.map((block, index) => ({
-      id: `item_${hashText(`${id}:${block.id}:${index}`)}`,
-      blockId: block.id,
-      block,
-      order: index,
-      enabled: true
-    }))
-  };
-}
+function summarizeVerification(session: SourceSession | undefined, legacyEvidence: string[]): VerificationSummary {
+  const runs = (session?.commands || []).filter((run) => isVerificationCommand(run.command));
+  if (!session?.commands) return legacyVerification(legacyEvidence);
 
-export function renderContextPackOutput(pack: ContextPack): ContextPackOutput {
-  const normalizedPack = normalizeContextPack(pack);
-  const warnings = buildPackWarnings(normalizedPack);
-  const enabledItems = normalizedPack.items.filter((item) => item.enabled);
-  const estimatedChars = enabledItems.reduce((total, item) => total + item.block.text.length, 0);
-  const markdown = renderContextPackMarkdown(normalizedPack, enabledItems, estimatedChars, warnings);
-  return {
-    pack: normalizedPack,
-    markdown,
-    json: {
-      id: normalizedPack.id,
-      name: normalizedPack.name,
-      createdAt: normalizedPack.createdAt,
-      updatedAt: normalizedPack.updatedAt,
-      includeRawTranscript: normalizedPack.includeRawTranscript,
-      estimatedChars,
-      warnings,
-      items: enabledItems
-    },
-    estimatedChars,
-    warnings
-  };
-}
-
-export function normalizeContextPack(pack: ContextPack): ContextPack {
-  const includeRawTranscript = pack.includeRawTranscript === true;
-  return {
-    ...pack,
-    includeRawTranscript,
-    name: pack.name.trim() || "Untitled context pack",
-    items: pack.items
-      .map((item, index) => ({
-        ...item,
-        order: Number.isFinite(item.order) ? item.order : index,
-        enabled: item.enabled !== false,
-        block: sanitizeBlockForPack(item.block, includeRawTranscript)
-      }))
-      .sort((a, b) => a.order - b.order)
-      .map((item, index) => ({ ...item, order: index }))
-  };
-}
-
-export function buildTeamTimelineExport(packet: HandoffPacket, options: { includeRawTranscript?: boolean } = {}): HandoffPacket {
-  const normalized = normalizeHandoffPacket(packet);
-  const includeRawTranscript = options.includeRawTranscript === true;
-  const sourceSession = normalized.sourceSession
-    ? {
-        ...normalized.sourceSession,
-        transcript: includeRawTranscript ? normalized.sourceSession.transcript : [],
-        transcriptExcerpt: includeRawTranscript ? normalized.sourceSession.transcriptExcerpt : "Raw transcript excluded from team sync export."
-      }
-    : undefined;
-  const sources = includeRawTranscript
-    ? normalized.sources
-    : normalized.sources.map((source) => ({ ...source, snippets: [] }));
-  const engineeringMemory: EngineeringMemory = {
-    ...normalized.engineeringMemory!,
-    teamSync: {
-      mode: "sync-ready",
-      rawTranscript: includeRawTranscript ? "included" : "excluded",
-      filePreviewRedaction: "enabled",
-      secretsRedaction: "enabled",
-      userControlledSync: true
-    }
-  };
-  const exportPacket: HandoffPacket = {
-    ...normalized,
-    sourceSession,
-    sources,
-    engineeringMemory,
-    markdown: "",
-    markdownPath: normalized.markdownPath
-  };
-  return {
-    ...exportPacket,
-    markdown: renderHandoffMarkdown(exportPacket, includeRawTranscript)
-  };
-}
-
-function match(snippets: string[], pattern: RegExp, count: number): string[] {
-  return limit(snippets.filter((snippet) => pattern.test(snippet)).reverse(), count);
-}
-
-function list(values: string[]): string {
-  const clean = unique(values);
-  if (clean.length === 0) return "- None captured.";
-  return clean.map((value) => `- ${value}`).join("\n");
-}
-
-function sourceSessionToSignals(session: SourceSession): AgentSignal[] {
-  return [
-    {
-      source: session.source,
-      path: session.path,
-      modifiedAt: session.updatedAt,
-      snippets: session.transcript.map((entry) => entry.text)
-    }
-  ];
-}
-
-function firstUsefulUserMessage(session: SourceSession): string {
-  return cleanLongText(session.transcript.find((entry) => entry.role === "user" && toHandoffSignal(entry.text))?.text || "");
-}
-
-function latestUsefulUserMessage(session: SourceSession): string {
-  const candidates = session.transcript
-    .filter((entry) => entry.role === "user")
-    .map((entry) => cleanLongText(entry.text))
-    .filter(Boolean);
-  return candidates.at(-1) || "";
-}
-
-function latestAssistantMessage(session: SourceSession): string {
-  const candidates = session.transcript
-    .filter((entry) => entry.role === "assistant")
-    .map((entry) => cleanLongText(entry.text))
-    .filter(Boolean);
-  return candidates.at(-1) || "";
-}
-
-function latestPlanMessage(session: SourceSession): string {
-  const candidates = session.transcript
-    .filter((entry) => entry.role === "assistant")
-    .map((entry) => cleanLongText(entry.text))
-    .filter((text) => /(plan|steps|approach|implementation|todo|next|will|going to|checklist)/i.test(text));
-  return candidates.at(-1) || "";
-}
-
-function cleanLongText(text: string): string {
-  const clean = toHandoffSignal(text).replace(/\s+/g, " ").trim();
-  return clean.length > 1200 ? `${clean.slice(0, 1200)}...` : clean;
-}
-
-function meaningfulList(values: string[], fallback: string[]): string[] {
-  const clean = unique(values.filter((value) => !/None captured/i.test(value)));
-  return clean.length ? clean : fallback;
-}
-
-function inferVerification(sections: HandoffSections, sourceSession: SourceSession | undefined): VerificationSummary {
-  const transcriptText = sourceSession?.transcript.map((entry) => entry.text).join("\n") || "";
-  const evidence = [...sections.commandsRun, ...sections.errors, transcriptText].join("\n");
-  const verificationCommands = unique(
-    sections.commandsRun.filter((command) => /\b(npm (run )?(test|typecheck|build)|pnpm (test|build)|yarn (test|build)|bun test|vitest|jest|tsc|pytest|cargo test|go test)\b/i.test(command))
-  );
-  const commands = verificationCommands.map((command) => ({
-    command,
-    status: inferCommandStatus(command, evidence),
-    evidence: matchingEvidence(command, evidence)
+  const latest = new Map<string, CommandRun>();
+  for (const run of runs) latest.set(verificationKey(run.command), run);
+  const latestRuns = [...latest.values()].sort((a, b) => a.seq - b.seq);
+  const commands: VerificationCommand[] = latestRuns.map((run) => ({
+    command: truncate(verificationLabel(run.command), 160),
+    status: run.status,
+    exitCode: run.exitCode,
+    evidence: run.errorLine
   }));
-  const failed = commands.some((command) => command.status === "failed") || sections.errors.some((error) => /(test|typecheck|build|lint).{0,80}(fail|error)|failed/i.test(error));
+
+  const failed = commands.some((command) => command.status === "failed");
   const passed = commands.length > 0 && commands.every((command) => command.status === "passed");
-  const status: VerificationStatus = failed ? "failed" : passed ? "passed" : "unknown";
-  const gaps =
-    commands.length === 0
-      ? ["No verification command was captured in the source session."]
-      : status === "unknown"
-        ? ["Verification commands were captured, but their result was not explicit."]
-        : [];
-  return { status, commands, gaps };
+  const lastEdit = Math.max(-1, ...(session.edits || []).map((edit) => edit.seq));
+  const lastPass = Math.max(-1, ...latestRuns.filter((run) => run.status === "passed").map((run) => run.seq));
+  const stale = passed && lastEdit > lastPass;
+
+  const gaps: string[] = [];
+  if (!commands.length) gaps.push("No tests, type checks, or builds were run in the session.");
+  else if (!failed && !passed) gaps.push("Some checks ran without a recorded result.");
+  if (stale) gaps.push("Files were edited after the last passing check.");
+
+  return { status: failed ? "failed" : passed && !stale ? "passed" : "unknown", commands, gaps };
 }
 
-function inferCommandStatus(command: string, evidence: string): VerificationStatus {
-  const commandName = command.replace(/\s+/g, " ").slice(0, 80).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const nearCommand = new RegExp(`${commandName}[\\s\\S]{0,500}`, "i").exec(evidence)?.[0] || evidence;
-  if (/(failed|failure|error|exception|exit code [1-9]|Process exited with code [1-9])/i.test(nearCommand)) return "failed";
-  if (/(passed|success|succeeded|0 failed|Process exited with code 0|✓|✔)/i.test(nearCommand)) return "passed";
-  return "unknown";
+/** Packets and inputs without structured command data: look for verification commands in text. */
+function legacyVerification(evidence: string[]): VerificationSummary {
+  const commands = unique(evidence.filter(isVerificationCommand)).map((command) => ({
+    command,
+    status: /\b(failed|failure|error)\b/i.test(command) ? ("failed" as const) : /\b(passed|succeeded)\b/i.test(command) ? ("passed" as const) : ("unknown" as const)
+  }));
+  const failed = commands.some((command) => command.status === "failed");
+  const passed = commands.length > 0 && commands.every((command) => command.status === "passed");
+  return {
+    status: failed ? "failed" : passed ? "passed" : "unknown",
+    commands,
+    gaps: commands.length ? (failed || passed ? [] : ["Some checks ran without a recorded result."]) : ["No tests, type checks, or builds were run in the session."]
+  };
 }
 
-function matchingEvidence(command: string, evidence: string): string | undefined {
-  const commandWords = command.split(/\s+/).filter((word) => word.length > 2).slice(0, 3);
-  const line = evidence.split("\n").find((candidate) => commandWords.some((word) => candidate.includes(word)));
-  return line ? cleanLongText(line).slice(0, 240) : undefined;
-}
-
-function inferWorkPhase(sections: HandoffSections, verification: VerificationSummary, agentPlan: string, fileChanges: FileChange[]): WorkPhase {
-  if (sections.blockers.length > 0) return "blocked";
-  if (verification.status === "failed" || sections.errors.length > 0) return "debugging";
-  if (verification.commands.length > 0) return "verification";
-  if (sections.todos.length > 0 || fileChanges.length > 0) return "implementation";
+function inferWorkPhase(sections: HandoffSections, verification: VerificationSummary, plan: PlanItem[] | undefined, agentPlan: string, fileChanges: FileChange[]): WorkPhase {
+  if (sections.blockers.length) return "blocked";
+  if (verification.status === "failed") return "debugging";
+  if (plan?.some((item) => item.status !== "completed")) return plan.some((item) => item.status !== "pending") || fileChanges.length ? "implementation" : "planning";
+  if (verification.status === "passed") return "review";
+  if (verification.commands.length) return "verification";
+  if (sections.todos.length || fileChanges.length) return "implementation";
   if (agentPlan) return "planning";
   return "handoff";
+}
+
+function latestPlanMessage(assistantMessages: string[]): string {
+  const plan = [...assistantMessages].reverse().find((text) => /^(?:plan|here'?s (?:the|my) plan|steps?|approach)\b\s*:?/im.test(text));
+  return plan ? truncate(plan, 1_500) : "";
 }
 
 function summarizeRepoStats(fileChanges: FileChange[]) {
@@ -658,11 +335,52 @@ function summarizeRepoStats(fileChanges: FileChange[]) {
 function buildContextSignals(sections: HandoffSections, latestUserInstruction: string, latestAssistantSummary: string): ContextSignal[] {
   const signals: ContextSignal[] = [];
   for (const text of limit(sections.decisions, 4)) signals.push({ kind: "decision", text });
-  for (const text of limit(sections.doNotRepeat, 3)) signals.push({ kind: "constraint", text });
+  for (const text of limit(sections.doNotRepeat, 4)) signals.push({ kind: "constraint", text });
   for (const text of limit([...sections.blockers, ...sections.errors], 4)) signals.push({ kind: "risk", text });
-  if (latestUserInstruction) signals.push({ kind: "anchor", text: `Latest user instruction: ${latestUserInstruction}` });
-  if (latestAssistantSummary) signals.push({ kind: "anchor", text: `Latest assistant summary: ${latestAssistantSummary}` });
-  return signals.slice(0, 10);
+  if (latestUserInstruction) signals.push({ kind: "anchor", text: `Latest user instruction: ${truncate(latestUserInstruction, 300)}` });
+  if (latestAssistantSummary) signals.push({ kind: "anchor", text: `Latest agent update: ${truncate(latestAssistantSummary, 300)}` });
+  return signals.slice(0, 12);
+}
+
+function extractFilePaths(snippets: string[]): string[] {
+  const pattern = /(?:^|[\s`'"(])((?:\.{0,2}\/)?(?:[\w.-]+\/)*[\w.-]+\.(?:tsx?|jsx?|mjs|cjs|json|md|ya?ml|toml|sql|sh|py|go|rs|rb|java|kt|swift|css|html))(?=$|[\s`'"),.;:!?])/g;
+  return unique(snippets.flatMap((snippet) => Array.from(snippet.matchAll(pattern), (match) => match[1])));
+}
+
+function withRepoRelativeEdits(session: SourceSession, repoPath: string): SourceSession {
+  const root = canonicalPath(repoPath);
+  const edits = (session.edits || []).map((edit) => {
+    if (!isAbsolute(edit.path)) return edit;
+    const rel = relative(root, canonicalPath(edit.path));
+    return rel && !rel.startsWith("..") && !isAbsolute(rel) ? { ...edit, path: rel } : edit;
+  });
+  return { ...session, edits };
+}
+
+// ---------------------------------------------------------------------------
+// Normalization (packets saved by older versions)
+
+export function normalizeHandoffPacket(packet: HandoffPacket): HandoffPacket {
+  const repo = {
+    ...packet.repo,
+    fileChanges: packet.repo.fileChanges?.length ? packet.repo.fileChanges : legacyFileChanges(packet.repo.dirtyFiles || [])
+  };
+  const derived = buildHandoffSummary(packet.task, repo, packet.sourceSession, packet.sections);
+  const existing = packet.handoffSummary;
+  const handoffSummary: HandoffContinuitySummary = existing
+    ? {
+        ...derived,
+        ...existing,
+        fileChanges: existing.fileChanges?.length ? existing.fileChanges : derived.fileChanges,
+        verification: existing.verification || derived.verification,
+        repoStats: existing.repoStats || derived.repoStats,
+        contextSignals: existing.contextSignals?.length ? existing.contextSignals : derived.contextSignals,
+        sourceSession: existing.sourceSession || derived.sourceSession,
+        repo: existing.repo || derived.repo
+      }
+    : derived;
+  const engineeringMemory = packet.engineeringMemory || buildEngineeringMemory(packet.task, repo, packet.sourceSession, packet.id, handoffSummary);
+  return { ...packet, repo, handoffSummary, engineeringMemory };
 }
 
 export function buildEngineeringMemory(
@@ -673,6 +391,7 @@ export function buildEngineeringMemory(
   summary: HandoffContinuitySummary
 ): EngineeringMemory {
   const sourceLabel = sourceSession ? `${sourceSession.source}:${sourceSession.id}` : "local-capture";
+  const verified = summary.verification.commands.length > 0;
   return {
     version: 1,
     identity: {
@@ -684,25 +403,18 @@ export function buildEngineeringMemory(
       sessionId: sourceSession?.id,
       sourceAgent: sourceSession?.source
     },
-    positioning: {
-      category: "handoff-ledger",
-      buyer: "ai-heavy-engineering-teams",
-      moat: "provenance-backed-engineering-memory"
-    },
     intent: facts("intent", [summary.originalQuestion, summary.latestUserInstruction], "user-authored", "high", sourceLabel),
     decisions: facts("decision", summary.decisions, "transcript-derived", "medium", sourceLabel),
-    constraints: facts("constraint", summary.contextSignals.filter((signal) => signal.kind === "constraint").map((signal) => signal.text), "transcript-derived", "medium", sourceLabel),
+    constraints: facts("constraint", summary.constraints || [], "user-authored", "medium", sourceLabel),
     verification: facts(
       "verification",
-      summary.verification.commands.length
-        ? summary.verification.commands.map((command) => `${command.status}: ${command.command}`)
-        : summary.verification.gaps,
+      verified ? summary.verification.commands.map((command) => `${command.status}: ${command.command}`) : summary.verification.gaps,
       "command-derived",
-      summary.verification.commands.length ? "high" : "low",
+      verified ? "high" : "low",
       sourceLabel
     ),
     risks: facts("risk", [...summary.blockers, ...summary.errors], "transcript-derived", "medium", sourceLabel),
-    nextActions: facts("next-action", [summary.nextAction, ...summary.remainingWork], "ai-inferred", "medium", sourceLabel),
+    nextActions: facts("next-action", [summary.nextAction, ...summary.remainingWork], summary.plan ? "transcript-derived" : "ai-inferred", "medium", sourceLabel),
     changedFiles: facts("changed-file", formatFileChanges(summary.fileChanges), "diff-derived", "high", repo.repoPath),
     teamSync: {
       mode: "local-only",
@@ -714,249 +426,260 @@ export function buildEngineeringMemory(
   };
 }
 
-function facts(
-  category: string,
-  values: string[],
-  provenanceKind: ProvenanceKind,
-  confidence: "high" | "medium" | "low",
-  source: string
-): MemoryFact[] {
+function facts(category: string, values: string[], provenanceKind: ProvenanceKind, confidence: "high" | "medium" | "low", source: string): MemoryFact[] {
   return unique(values)
-    .filter((value) => !/^None captured\.?$/i.test(value))
     .slice(0, 12)
-    .map((text) => ({
-      id: stableId(category, text),
-      text,
-      provenance: {
-        kind: provenanceKind,
-        confidence,
-        source
-      }
-    }));
+    .map((text) => ({ id: stableId(category, text), text, provenance: { kind: provenanceKind, confidence, source } }));
 }
 
 function stableId(prefix: string, seed: string): string {
   return `${prefix}_${hashText(seed || prefix)}`;
 }
 
-function renderEngineeringMemory(memory: EngineeringMemory): string {
-  return [
-    `- Category: ${memory.positioning.category}`,
-    `- Buyer: ${memory.positioning.buyer}`,
-    `- Moat: ${memory.positioning.moat}`,
-    `- IDs: task=${memory.identity.taskId}, repo=${memory.identity.repoId}, branch=${memory.identity.branchId}, commit=${memory.identity.commitId}, handoff=${memory.identity.handoffId}`,
-    `- Team sync: ${memory.teamSync.mode}, transcript ${memory.teamSync.rawTranscript}, redaction ${memory.teamSync.secretsRedaction}`,
-    ...memory.decisions.slice(0, 4).map(renderMemoryFact),
-    ...memory.verification.slice(0, 4).map(renderMemoryFact),
-    ...memory.risks.slice(0, 4).map(renderMemoryFact),
-    ...memory.nextActions.slice(0, 4).map(renderMemoryFact)
-  ].join("\n");
-}
+// ---------------------------------------------------------------------------
+// Rendering
 
-function renderMemoryFact(fact: MemoryFact): string {
-  return `- ${fact.text} [${fact.provenance.kind}, ${fact.provenance.confidence}]`;
-}
+/**
+ * The handoff an agent reads. Ordered by what the next agent needs first; empty sections are omitted.
+ */
+export function renderHandoffMarkdown(packet: HandoffPacket, includeTranscript = true): string {
+  const normalized = normalizeHandoffPacket(packet);
+  const summary = normalized.handoffSummary!;
+  const session = normalized.sourceSession;
+  const stats = summary.repoStats;
+  const meta = [
+    basename(normalized.repo.repoPath),
+    normalized.repo.isGitRepo ? `${normalized.repo.branch} @ ${normalized.repo.commit}` : "not a git repo",
+    stats.dirtyFiles ? `${stats.dirtyFiles} changed ${stats.dirtyFiles === 1 ? "file" : "files"} (+${stats.additions} -${stats.deletions})` : "clean tree",
+    session ? `${sourceLabel(session.source)} session` : undefined,
+    normalized.createdAt.slice(0, 16).replace("T", " ")
+  ].filter(Boolean);
 
-function renderCurrentState(summary: HandoffContinuitySummary): string {
-  return [
+  const lines: string[] = [
+    `# Handoff: ${normalized.task}`,
+    "",
+    `> ${meta.join(" · ")}`,
+    "",
+    `${normalized.targetAgent ? `For ${normalized.targetAgent}: c` : "C"}ontinue this task. Check that the repo matches the state below, then start from **Next action**.`
+  ];
+
+  const section = (title: string, body: string | string[] | undefined) => {
+    const content = Array.isArray(body) ? body.filter(Boolean).join("\n") : body?.trim();
+    if (content) lines.push("", `## ${title}`, content);
+  };
+
+  const objective = summary.originalQuestion;
+  section("Objective", objective);
+  if (summary.latestUserInstruction && summary.latestUserInstruction !== objective) section("Latest request", summary.latestUserInstruction);
+  section("Next action", summary.nextAction);
+  section("Status", [
     `- Phase: ${summary.workPhase}`,
-    `- Repo state: ${summary.repoStats.dirtyFiles} dirty, ${summary.repoStats.stagedFiles} staged, ${summary.repoStats.unstagedFiles} unstaged, ${summary.repoStats.untrackedFiles} untracked`,
-    `- Diff volume: +${summary.repoStats.additions} -${summary.repoStats.deletions}`,
-    `- Verification: ${summary.verification.status}`
-  ].join("\n");
-}
+    `- Verification: ${summary.verification.status}`,
+    summary.latestAssistantSummary ? `- Last update from the agent: ${truncate(oneLine(summary.latestAssistantSummary), 600)}` : ""
+  ]);
+  section("Plan", summary.plan?.length ? summary.plan.map(formatPlanItem) : summary.agentPlan && !summary.plan ? truncate(summary.agentPlan, 1_500) : undefined);
+  section("Verification", renderVerification(summary.verification));
+  section("Changed files", renderFileChanges(summary.fileChanges));
+  section("Decisions", bullets(summary.decisions, 6));
+  section("Constraints", bullets(summary.constraints || normalized.sections.doNotRepeat, 6));
+  section("Blockers", bullets(summary.blockers, 6));
+  if (!summary.verification.commands.length) section("Errors", bullets(summary.errors, 6));
+  section("Earlier context", session?.compactSummary ? truncate(session.compactSummary, 2_000) : undefined);
+  section("Links", bullets(session?.links || [], 5));
+  if (includeTranscript) section("Recent transcript", session?.transcriptExcerpt);
 
-function renderVerification(verification: VerificationSummary): string {
-  const lines = [`- Status: ${verification.status}`];
-  for (const command of verification.commands) {
-    lines.push(`- ${command.status}: ${command.command}`);
-  }
-  for (const gap of verification.gaps) lines.push(`- Gap: ${gap}`);
+  lines.push(
+    "",
+    "---",
+    `Source: ${session ? `${sourceLabel(session.source)} session ${session.id}${session.threadName ? ` (“${session.threadName}”)` : ""}` : "local capture"}`,
+    `Repo: ${normalized.repo.repoPath}`,
+    `Generated by ContextPool ${VERSION} at ${normalized.createdAt}`
+  );
   return lines.join("\n");
 }
 
+/** Import-ready context for an agent: the handoff without the transcript, plus the structured summary. */
+export function buildAgentContext(packet: HandoffPacket): { markdown: string; summary: HandoffContinuitySummary; engineeringMemory: EngineeringMemory } {
+  const normalized = normalizeHandoffPacket(packet);
+  return {
+    markdown: renderHandoffMarkdown(normalized, false),
+    summary: normalized.handoffSummary!,
+    engineeringMemory: normalized.engineeringMemory!
+  };
+}
+
+export function renderAgentContextMarkdown(packet: HandoffPacket): string {
+  return renderHandoffMarkdown(packet, false);
+}
+
+function renderVerification(verification: VerificationSummary): string[] {
+  const glyph = { passed: "✓", failed: "✗", unknown: "?" } as const;
+  return [
+    ...verification.commands.map((command) => {
+      const exit = command.status === "failed" && command.exitCode ? ` (exit ${command.exitCode})` : command.status === "unknown" ? " (result not recorded)" : "";
+      return `- ${glyph[command.status]} \`${command.command}\`${exit}${command.evidence ? ` — ${command.evidence}` : ""}`;
+    }),
+    ...verification.gaps.map((gap) => `- Gap: ${gap}`)
+  ];
+}
+
+function renderFileChanges(changes: FileChange[]): string[] {
+  const lines = formatFileChanges(changes.slice(0, 30)).map((line) => `- ${line}`);
+  if (changes.length > 30) lines.push(`- …and ${changes.length - 30} more`);
+  return lines;
+}
+
+function bullets(values: string[], max: number): string[] {
+  return unique(values)
+    .slice(0, max)
+    .map((value) => `- ${truncate(oneLine(value), 300)}`);
+}
+
+function formatPlanItem(item: PlanItem): string {
+  if (item.status === "completed") return `- [x] ${item.text}`;
+  return `- [ ] ${item.text}${item.status === "in_progress" ? " (in progress)" : ""}`;
+}
+
 function legacyFileChanges(files: string[]): FileChange[] {
-  return unique(files).map((path) => ({
-    path,
-    status: "modified",
-    additions: 0,
-    deletions: 0,
-    staged: false,
-    unstaged: true,
-    untracked: false
-  }));
+  return unique(files).map((path) => ({ path, status: "modified", additions: 0, deletions: 0, staged: false, unstaged: true, untracked: false }));
 }
 
 function formatFileChanges(changes: FileChange[]): string[] {
   return changes.map((change) => {
     const stat = change.additions || change.deletions ? ` (+${change.additions} -${change.deletions})` : "";
-    const oldPath = change.oldPath ? `${change.oldPath} -> ` : "";
+    const oldPath = change.oldPath ? `${change.oldPath} → ` : "";
     return `${statusLabel(change)} ${oldPath}${change.path}${stat}`;
   });
 }
 
 function statusLabel(change: FileChange): string {
   if (change.untracked) return "??";
-  if (change.status === "added") return "A";
-  if (change.status === "deleted") return "D";
-  if (change.status === "renamed") return "R";
-  if (change.status === "copied") return "C";
-  if (change.status === "modified") return "M";
-  return "?";
+  return { added: "A", deleted: "D", renamed: "R", copied: "C", modified: "M", untracked: "??", unknown: "?" }[change.status];
 }
 
-function dedupeBlocks(blocks: ContextBlock[]): ContextBlock[] {
+// ---------------------------------------------------------------------------
+// Context blocks
+
+export function deriveContextBlocks(packet: HandoffPacket): ContextBlock[] {
+  const normalized = normalizeHandoffPacket(packet);
+  const summary = normalized.handoffSummary!;
+  const memory = normalized.engineeringMemory!;
+  const source = `${summary.sourceSession?.source || "handoff"}:${summary.sourceSession?.id || normalized.id}`;
+  const blocks: ContextBlock[] = [];
   const seen = new Set<string>();
-  const result: ContextBlock[] = [];
-  for (const block of blocks) {
-    const key = `${block.category}:${block.text}`;
-    if (seen.has(key)) continue;
+  const push = (category: ContextBlock["category"], title: string, text: string, provenance: ProvenanceKind, confidence: "high" | "medium" | "low", provenanceSource = source) => {
+    const clean = redactSecrets(oneLine(text)).slice(0, 2_000);
+    const key = `${category}:${clean}`;
+    if (clean.length < 3 || seen.has(key)) return;
     seen.add(key);
-    result.push(block);
-  }
-  return result;
-}
-
-function sanitizeBlockForPack(block: ContextBlock, includeRawTranscript: boolean): ContextBlock {
-  const text = includeRawTranscript || block.category !== "transcript" ? block.text : redactSensitiveText(block.text);
-  return {
-    ...block,
-    text,
-    estimatedChars: text.length
-  };
-}
-
-function cleanContextText(text: string): string {
-  return redactSensitiveText(toHandoffSignal(text).replace(/\s+/g, " ").trim()).slice(0, 2000);
-}
-
-function redactSensitiveText(text: string): string {
-  return text
-    .replace(/\b[A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|DATABASE_URL|DSN)[A-Z0-9_]*\s*=\s*[^\s,;]+/gi, (match) => {
-      const [key] = match.split("=");
-      return `${key.trim()}=[redacted]`;
-    })
-    .replace(/\b(?:sk|pk|rk|ghp|gho|github_pat)_[A-Za-z0-9_-]{12,}\b/g, "[redacted-token]")
-    .replace(/\b[A-Za-z0-9+/]{32,}={0,2}\b/g, "[redacted-secret]");
-}
-
-function buildPackWarnings(pack: ContextPack): string[] {
-  const warnings: string[] = [];
-  if (!pack.includeRawTranscript && pack.items.some((item) => item.block.category === "transcript")) {
-    warnings.push("Raw transcript blocks were redacted by default. Enable raw transcript only when the destination is trusted.");
-  }
-  if (pack.items.some((item) => /\[redacted/.test(item.block.text))) {
-    warnings.push("Potential secrets were redacted from one or more context blocks.");
-  }
-  if (!pack.items.some((item) => item.enabled)) warnings.push("No enabled context blocks are present in this pack.");
-  return warnings;
-}
-
-function renderContextPackMarkdown(pack: ContextPack, items: ContextPackItem[], estimatedChars: number, warnings: string[]): string {
-  const sections = new Map<ContextBlock["category"], ContextPackItem[]>();
-  for (const item of items) {
-    const current = sections.get(item.block.category) || [];
-    current.push(item);
-    sections.set(item.block.category, current);
-  }
-  const lines = [
-    `# Context Pack: ${pack.name}`,
-    "",
-    `Pack ID: ${pack.id}`,
-    `Updated: ${pack.updatedAt}`,
-    `Estimated characters: ${estimatedChars}`,
-    `Raw transcript: ${pack.includeRawTranscript ? "included" : "excluded/redacted"}`,
-    "",
-    "## Use This Context",
-    "Reuse the selected context below without re-discovering prior decisions, verification, changed files, or next actions.",
-    ""
-  ];
-  if (warnings.length) {
-    lines.push("## Warnings", ...warnings.map((warning) => `- ${warning}`), "");
-  }
-  for (const [category, categoryItems] of sections) {
-    lines.push(`## ${contextCategoryTitle(category)}`);
-    for (const item of categoryItems) {
-      lines.push(`- ${item.block.text}`);
-      lines.push(`  - Source: ${item.block.sourceTask} / ${item.block.sourceHandoffId}`);
-      lines.push(`  - Provenance: ${item.block.provenance.kind}, ${item.block.provenance.confidence}`);
-    }
-    lines.push("");
-  }
-  return lines.join("\n").trimEnd();
-}
-
-function contextCategoryTitle(category: ContextBlock["category"]): string {
-  switch (category) {
-    case "next-action":
-      return "Next Actions";
-    case "changed-file":
-      return "Changed Files";
-    default:
-      return labelize(category);
-  }
-}
-
-function labelize(value: string): string {
-  return value.replace(/-/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
-}
-
-function toHandoffSignal(text: string): string {
-  if (
-    /(<permissions instructions>|<collaboration_mode>|<skills_instructions>|<plugins_instructions>|<environment_context>|<image>)/i.test(text) ||
-    /Knowledge cutoff:|You are Codex|Filesystem sandboxing defines|Available skills|Skill roots|Tool definitions|Valid channels:|# Handoff:/i.test(text)
-  ) {
-    return "";
-  }
-  return text.length > 1200 ? `${text.slice(0, 1200)}...` : text;
-}
-
-function segmentText(text: string): string[] {
-  return text
-    .split(/\n+|(?<=[.!?])\s+/)
-    .map((part) => part.trim())
-    .filter((part) => part.length > 8)
-    .map((part) => (part.length > 800 ? `${part.slice(0, 800)}...` : part));
-}
-
-function extractFilePaths(snippets: string[]): string[] {
-  const matches: string[] = [];
-  const pattern = /\b(?:\.{0,2}\/)?(?:src|apps|app|packages|lib|server|client|tests?|docs)\/[A-Za-z0-9._/-]+\.[A-Za-z0-9]{1,8}\b|\b[A-Za-z0-9._/-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|yml|yaml|toml|sql|sh|py|go|rs)\b/g;
-  for (const snippet of snippets) {
-    const found = snippet.match(pattern);
-    if (!found) continue;
-    for (const file of found) {
-      matches.push(file.replace(/[),.;:!?]+$/g, ""));
-    }
-  }
-  return unique(matches);
-}
-
-async function improveWithOllama(task: string, sections: HandoffSections): Promise<string | undefined> {
-  const model = process.env.CTXPOOL_OLLAMA_MODEL || "llama3.1";
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 3500);
-  try {
-    const response = await fetch("http://127.0.0.1:11434/api/generate", {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        model,
-        stream: false,
-        prompt: [
-          "Write one concise next best action for a coding-agent handoff.",
-          `Task: ${task}`,
-          `Todos: ${sections.todos.join("; ")}`,
-          `Blockers: ${sections.blockers.join("; ")}`,
-          `Files: ${sections.filesTouched.join("; ")}`
-        ].join("\n")
-      })
+    blocks.push({
+      id: stableId(`${normalized.id}:${category}`, `${title}:${clean}`),
+      sourceHandoffId: normalized.id,
+      sourceTask: normalized.task,
+      sourceCreatedAt: normalized.createdAt,
+      category,
+      title,
+      text: clean,
+      provenance: { kind: provenance, confidence, source: provenanceSource },
+      estimatedChars: clean.length
     });
-    if (!response.ok) return undefined;
-    const json = (await response.json()) as { response?: string };
-    return json.response?.trim().split("\n")[0]?.slice(0, 500);
-  } finally {
-    clearTimeout(timeout);
+  };
+
+  push("intent", "Objective", summary.originalQuestion, "user-authored", "high");
+  if (summary.latestUserInstruction !== summary.originalQuestion) push("instruction", "Latest request", summary.latestUserInstruction, "user-authored", "high");
+  push("next-action", "Next action", summary.nextAction, summary.plan ? "transcript-derived" : "ai-inferred", "medium");
+  for (const fact of memory.decisions) push("decision", "Decision", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
+  for (const fact of memory.constraints) push("constraint", "Constraint", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
+  for (const fact of memory.verification) push("verification", "Verification", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
+  for (const fact of memory.risks) push("risk", "Risk", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
+  for (const fact of memory.nextActions.slice(1)) push("next-action", "Remaining work", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
+  for (const fact of memory.changedFiles) push("changed-file", "Changed file", fact.text, fact.provenance.kind, fact.provenance.confidence, fact.provenance.source);
+  for (const entry of normalized.sourceSession?.transcript || []) {
+    if (entry.role === "tool" || entry.text.length < 20) continue;
+    push("transcript", entry.role === "user" ? "User" : "Agent", entry.text, "transcript-derived", "medium");
   }
+  return blocks.slice(0, 160);
+}
+
+// ---------------------------------------------------------------------------
+// Team export
+
+export function buildTeamTimelineExport(packet: HandoffPacket, options: { includeRawTranscript?: boolean } = {}): HandoffPacket {
+  const normalized = normalizeHandoffPacket(packet);
+  const includeRawTranscript = options.includeRawTranscript === true;
+  const sourceSession = normalized.sourceSession
+    ? {
+        ...normalized.sourceSession,
+        transcript: includeRawTranscript ? normalized.sourceSession.transcript : [],
+        transcriptExcerpt: includeRawTranscript ? normalized.sourceSession.transcriptExcerpt : "",
+        compactSummary: includeRawTranscript ? normalized.sourceSession.compactSummary : undefined
+      }
+    : undefined;
+  const exportPacket: HandoffPacket = {
+    ...normalized,
+    sourceSession,
+    sources: normalized.sources.map((source) => ({ ...source, snippets: includeRawTranscript ? source.snippets : [] })),
+    engineeringMemory: {
+      ...normalized.engineeringMemory!,
+      teamSync: {
+        mode: "sync-ready",
+        rawTranscript: includeRawTranscript ? "included" : "excluded",
+        filePreviewRedaction: "enabled",
+        secretsRedaction: "enabled",
+        userControlledSync: true
+      }
+    },
+    markdown: ""
+  };
+  exportPacket.markdown = renderHandoffMarkdown(exportPacket, includeRawTranscript);
+  // Packets saved by older versions were not redacted at capture; redact everything on the way out.
+  return redactDeep(exportPacket);
+}
+
+// ---------------------------------------------------------------------------
+// Optional local model
+
+async function suggestNextActionWithOllama(task: string, summary: HandoffContinuitySummary, configuredModel?: string): Promise<string | undefined> {
+  const host = process.env.OLLAMA_HOST ? normalizeOllamaHost(process.env.OLLAMA_HOST) : "http://127.0.0.1:11434";
+  const model = configuredModel || process.env.CTXPOOL_OLLAMA_MODEL || (await firstOllamaModel(host));
+  if (!model) return undefined;
+  const response = await fetch(`${host}/api/generate`, {
+    method: "POST",
+    signal: AbortSignal.timeout(15_000),
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      think: false,
+      options: { temperature: 0.2 },
+      prompt: [
+        "You write the single next action for a coding agent taking over a task.",
+        "Reply with one imperative sentence under 30 words. No preamble.",
+        "",
+        `Task: ${task}`,
+        `Objective: ${truncate(summary.originalQuestion, 400)}`,
+        `Latest request: ${truncate(summary.latestUserInstruction, 400)}`,
+        `Remaining: ${summary.remainingWork.slice(0, 5).join("; ") || "none recorded"}`,
+        `Verification: ${summary.verification.status}${summary.verification.commands.length ? ` (${summary.verification.commands.map((command) => `${command.command}: ${command.status}`).join("; ")})` : ""}`,
+        `Blockers: ${summary.blockers.join("; ") || "none"}`,
+        `Changed files: ${summary.fileChanges.slice(0, 10).map((change) => change.path).join(", ") || "none"}`
+      ].join("\n")
+    })
+  });
+  if (!response.ok) return undefined;
+  const json = (await response.json()) as { response?: string };
+  const sentence = json.response?.replace(/<think>[\s\S]*?<\/think>/g, "").trim().split("\n")[0]?.replace(/^["'“]|["'”]$/g, "");
+  return sentence ? truncate(sentence, 400) : undefined;
+}
+
+async function firstOllamaModel(host: string): Promise<string | undefined> {
+  const response = await fetch(`${host}/api/tags`, { signal: AbortSignal.timeout(1_500) });
+  if (!response.ok) return undefined;
+  const json = (await response.json()) as { models?: { name?: string }[] };
+  return json.models?.find((model) => model.name)?.name;
+}
+
+function normalizeOllamaHost(value: string): string {
+  const withScheme = /^https?:\/\//.test(value) ? value : `http://${value}`;
+  return withScheme.replace(/\/+$/, "");
 }

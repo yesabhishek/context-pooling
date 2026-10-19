@@ -1,152 +1,128 @@
 # ContextPool
 
-ContextPool is a local-first context builder for AI-assisted engineering work.
+Hand off AI coding sessions between agents without losing the thread.
 
-It captures handoff packets from Codex and Claude sessions, preserves repo state and provenance, then lets you drag reusable context blocks into agent-ready prompt packs for Codex, Claude, Cursor, or any MCP-capable tool.
-
-## Why
-
-AI coding sessions often lose the useful parts of prior work: task intent, decisions, constraints, files changed, verification state, blockers, and the next best action. ContextPool keeps that engineering memory local, structured, and reusable.
-
-The wedge is not generic long-term memory. It is provenance-backed engineering continuity:
-
-- Capture what changed, why it changed, what was verified, what failed, and what should happen next.
-- Preserve local-first trust by default.
-- Let users curate exactly which context goes into the next agent prompt.
-- Export sync-ready packets only when the user chooses.
-
-## Features
-
-- Local handoff capture from Codex and Claude JSONL sessions.
-- Git snapshot capture: branch, commit, dirty files, diff stats, patches, and recent commits.
-- Drag-and-drop context pack builder UI.
-- Reusable context blocks for intent, instructions, decisions, constraints, verification, risks, next actions, files, and transcript snippets.
-- Markdown and JSON prompt-pack export.
-- Local SQL.js storage under `~/.ctxpool` by default.
-- MCP tools for agents to read handoffs and curated context packs.
-- Redacted team timeline export with raw transcripts excluded by default.
-
-## Install
-
-Requires Node.js `>=22.5.0`.
+ContextPool reads the Codex or Claude session you just worked in, pairs it with the repo's git state, and writes a short handoff the next agent can act on: what was asked, the plan, which checks passed or failed, what changed, and the next action. Everything stays on your machine.
 
 ```sh
 npm install -g ctxpool
-ctxpool init
+ctxpool handoff
 ```
 
-For one-off usage without a global install:
+```
+  Handoff ready
+
+  Task     webhook-retries
+  Source   Claude · Webhook retries · 4m ago
+  Repo     billing-api · feature/webhook-retries @ 3f2c1a9 · 4 files +182 -37
+  Phase    debugging
+  Checks   ✗ npm test
+           ✓ npm run typecheck
+  Next     Fix the failing `npm test` (AssertionError: expected 2 to equal 1), then re-run it.
+
+  ✓ Copied to clipboard · ~1.4k tokens
+```
+
+Paste it into the next agent, or let the agent fetch it over MCP.
+
+## How it works
+
+- **Reads the agent's own records.** Plans come from the agent's to-do tools (`TodoWrite`, `update_plan`). Check results come from real exit codes. Edits come from the agent's edit tools. Prose heuristics only fill gaps, and they read your messages and the agent's, never tool output.
+- **Knows when checks are stale.** A pass followed by more edits is flagged as unverified. `npm test | tail` hides failures behind a 0 exit code, so piped checks are judged by their output.
+- **Picks the right session.** It uses the most recent primary session started in this repo and skips subagent and reviewer threads. If Codex and Claude were both active in the last 10 minutes, it asks which one to use.
+- **Redacts secrets at capture.** API keys, tokens, private keys, and credentials in URLs are redacted before anything is saved or copied. `.env` and key files never appear in diffs.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `ctxpool handoff` | Capture the current session and copy the handoff to the clipboard |
+| `ctxpool capture` | Same, without the clipboard |
+| `ctxpool sessions` | List the sessions ContextPool can read here (`--all` for every folder) |
+| `ctxpool tasks` | List tasks with saved handoffs |
+| `ctxpool show [task]` | Print the latest handoff (for a task) |
+| `ctxpool ui` | Open the context pack builder in your browser |
+| `ctxpool team export` | Write a redacted, sync-ready JSON packet |
+| `ctxpool mcp start` | Serve handoffs to agents over MCP (stdio) |
+| `ctxpool status` | Show where data lives and which agents were found |
+
+Useful options for `handoff` and `capture`:
 
 ```sh
-npx ctxpool --help
+ctxpool handoff --from codex           # choose the agent when both were active
+ctxpool handoff --session 01a15320     # a specific session id, or a path to a .jsonl file
+ctxpool handoff --task billing-flow    # name the task (defaults to the branch or repo)
+ctxpool handoff --budget 1500          # token budget for the transcript excerpt
+ctxpool handoff --no-transcript        # leave the transcript out entirely
+ctxpool handoff --json                 # machine-readable output
 ```
 
-## Quick Start
-
-Capture a handoff from the current workspace:
+## Connect an agent over MCP
 
 ```sh
-ctxpool handoff --from codex --no-ollama
+claude mcp add contextpool -- npx -y ctxpool mcp start
+codex mcp add contextpool -- npx -y ctxpool mcp start
 ```
 
-Open the local context builder UI:
+All tools are read-only.
 
-```sh
-ctxpool ui
+| Tool | Returns |
+| --- | --- |
+| `get_latest_agent_context` | The latest handoff as markdown plus a structured summary. Start here. |
+| `get_latest_handoff` | The latest handoff as markdown, optionally for a task |
+| `get_handoff_by_task` | The latest handoff for a task |
+| `get_task_status` | Next action, blockers, and touched files for a task |
+| `get_handoff_files` | Structured file changes from a handoff |
+| `list_tasks` | Tasks with handoffs, newest first |
+| `get_team_timeline_packet` | A redacted, sync-ready packet. The raw transcript is excluded by default. |
+| `list_context_packs` | Saved context packs |
+| `get_context_pack` | A context pack as markdown or JSON |
+
+## Context packs
+
+`ctxpool ui` turns saved handoffs into blocks (objectives, decisions, constraints, checks, changed files) that you can arrange into a reusable prompt. Transcript blocks are left out of exports unless you turn on **Include transcript** for that pack.
+
+## Configuration
+
+`ctxpool init` writes `~/.ctxpool/config.json`:
+
+```json
+{
+  "version": 1,
+  "ui": { "host": "127.0.0.1", "port": 4377 },
+  "ollama": { "enabled": false }
+}
 ```
 
-Then open:
+Set `ollama.enabled` (or pass `--ollama`) to have a local Ollama model phrase the next action. It uses `ollama.model` if set, otherwise the first installed model.
 
-```text
-http://127.0.0.1:4377
-```
+| Variable | Purpose |
+| --- | --- |
+| `CTXPOOL_HOME` | Store location (default `~/.ctxpool`) |
+| `CODEX_HOME` | Codex data (default `~/.codex`) |
+| `CLAUDE_CONFIG_DIR` | Claude Code data (default `~/.claude`) |
+| `CTXPOOL_EDITOR` | Editor command for "open file" in the UI |
+| `NO_COLOR` | Plain terminal output |
 
-If the default port is busy, `ctxpool ui` tries the next few ports automatically unless a fixed `--port` is provided.
+## Privacy and security
 
-## Context Packs
+- Data lives in `~/.ctxpool` with owner-only permissions. Nothing is sent anywhere.
+- Secrets are redacted at capture, and again on team export for packets saved by older versions.
+- The UI binds to `127.0.0.1`. It rejects requests addressed to other hostnames (DNS rebinding), cross-origin writes, and non-JSON writes. File previews are limited to repositories in saved handoffs and do not follow symlinks out of them.
 
-The UI turns saved handoffs into draggable context blocks. Add the useful blocks to a context pack, reorder them, disable noisy entries, and copy the generated markdown or JSON into another agent.
-
-Raw transcript text is redacted by default in context packs. Enable raw transcript export only when the destination is trusted.
-
-Saved packs stay local in the ContextPool store.
-
-## CLI
-
-```sh
-ctxpool init
-ctxpool handoff --from codex --no-ollama
-ctxpool capture --from claude --task billing-flow
-ctxpool ui
-ctxpool tasks
-ctxpool show latest --task billing-flow
-ctxpool team export --task billing-flow
-ctxpool mcp start
-```
-
-`ctxpool team export` writes a sync-ready JSON packet under the local ContextPool home directory. Raw transcript entries are excluded by default:
-
-```sh
-ctxpool team export --task my-task
-ctxpool team export --task my-task --include-transcript
-```
-
-## MCP Tools
-
-ContextPool exposes local MCP tools for agents:
-
-- `get_latest_handoff`
-- `get_handoff_by_task`
-- `list_tasks`
-- `get_task_status`
-- `get_latest_agent_context`
-- `get_handoff_files`
-- `get_team_timeline_packet`
-- `list_context_packs`
-- `get_context_pack`
-
-`get_team_timeline_packet` returns a sync-ready packet with raw transcripts excluded unless explicitly requested. `get_context_pack` returns a curated prompt pack as markdown by default or JSON when requested.
-
-## Privacy and Security
-
-- ContextPool is local-first. It stores data under `~/.ctxpool` unless `CTXPOOL_HOME` is set.
-- Handoff packets can include repo paths, diffs, transcript excerpts, and command output. Review exports before sharing.
-- Raw transcripts are excluded from team exports by default.
-- Context pack transcript blocks are redacted by default.
-- The UI binds to `127.0.0.1` by default. Avoid binding to public interfaces unless you understand the local-file exposure risk.
-- File preview/open APIs are restricted to repositories already captured in saved handoffs.
-
-Security issues should be reported privately; see `SECURITY.md`.
+Report security issues privately; see [SECURITY.md](SECURITY.md).
 
 ## Development
+
+Requires Node.js 22.13 or later. The store uses the built-in `node:sqlite`.
 
 ```sh
 npm install
 npm run typecheck
 npm test
 npm run build
+CTXPOOL_HOME=.ctxpool-test npm run dev -- handoff
 ```
-
-When working from source, run CLI commands through the development entrypoint:
-
-```sh
-CTXPOOL_HOME=.ctxpool-test npm run dev -- ui
-npm run dev -- --version
-```
-
-## Release Checks
-
-Before publishing:
-
-```sh
-npm test
-npm run typecheck
-npm run build
-npm audit --omit=dev
-npm pack --dry-run
-```
-
-Confirm the package contents include only intentional release files and no local stores, databases, logs, transcripts, or secrets.
 
 ## License
 
