@@ -11,7 +11,7 @@ type ToolResult = { content: { type: "text"; text: string }[]; isError?: boolean
 const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } as const;
 
 const INSTRUCTIONS = [
-  "ContextPool holds handoff packets captured from earlier Codex, Claude, and Gemini sessions: the objective, plan, verification results, changed files, and next action.",
+  "ContextPool holds handoff packets captured from earlier Codex, Claude, Gemini, and Antigravity sessions: the objective, plan, verification results, changed files, and next action.",
   "When continuing work in a repository, call get_latest_agent_context (or get_handoff_by_task) first and start from its Next action.",
   "Everything is local and read-only. Secrets are redacted at capture."
 ].join(" ");

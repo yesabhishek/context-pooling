@@ -1,8 +1,16 @@
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync, readdirSync, realpathSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { encodeClaudeProjectPath, listSessionCandidates, parseClaudeSession, parseCodexSession, parseGeminiSession, resolveSessionSource } from "./session.js";
-import { claude, codex, gemini, isolateEnv, tempDir, writeJsonl } from "./test-helpers.js";
+import {
+  encodeClaudeProjectPath,
+  listSessionCandidates,
+  parseAntigravitySession,
+  parseClaudeSession,
+  parseCodexSession,
+  parseGeminiSession,
+  resolveSessionSource
+} from "./session.js";
+import { antigravity, claude, codex, gemini, isolateEnv, tempDir, writeJsonl } from "./test-helpers.js";
 import type { CtxError } from "./util.js";
 
 let env: ReturnType<typeof isolateEnv>;
@@ -228,6 +236,99 @@ describe("Gemini sessions", () => {
   });
 });
 
+describe("Antigravity sessions", () => {
+  const { cleared, canceled } = antigravity.STATUS;
+
+  it("reads prompts, replies, commands, and edits from typed and generic steps", () => {
+    const cwd = tempDir("work");
+    const path = antigravity.conversation(env.antigravityHome, "a1b2c3d4-0000", cwd, [
+      // Compacted turns keep their metadata but lose their payload.
+      antigravity.userInput("", cleared),
+      antigravity.reply("", cleared),
+      antigravity.runCommand("npm run lint", undefined, "", { status: cleared }),
+      antigravity.checkpoint("### 1. Outstanding User Requests\n- Fix the flaky upload test"),
+      antigravity.systemMessage("Conversation resumed."),
+      antigravity.userInput("Fix the flaky upload test."),
+      antigravity.reply("Running the tests first."),
+      antigravity.runCommand("npm test", 1, "FAIL src/upload.test.ts\n1 failed, 11 passed"),
+      antigravity.edit("replace_file_content", join(cwd, "src/upload.ts")),
+      antigravity.edit("write_to_file", join(env.antigravityHome, "brain/a1b2c3d4-0000/implementation_plan.md")),
+      antigravity.edit("multi_replace_file_content", join(cwd, "src/rejected.ts"), canceled),
+      antigravity.tool("view_file", { AbsolutePath: join(cwd, "src/upload.ts") }),
+      antigravity.genericCommand("npm test -- upload", 0, "Tests  12 passed (12)"),
+      antigravity.cancelledCommand("npm run e2e"),
+      antigravity.reply("Fixed; the upload tests pass.")
+    ]);
+
+    const session = parseAntigravitySession(path);
+    expect(session).toMatchObject({ source: "antigravity", id: "a1b2c3d4-0000", cwd });
+    expect(session.transcript.filter((entry) => entry.role !== "tool").map((entry) => [entry.role, entry.text])).toEqual([
+      ["user", "Fix the flaky upload test."],
+      ["assistant", "Running the tests first."],
+      ["assistant", "Fixed; the upload tests pass."]
+    ]);
+    expect(session.commands).toMatchObject([
+      { command: "npm run lint", status: "unknown" },
+      { command: "npm test", status: "failed", exitCode: 1 },
+      { command: "npm test -- upload", status: "passed", exitCode: 0 }
+    ]);
+    expect(session.commands?.[1].errorLine).toContain("FAIL src/upload.test.ts");
+    expect(session.edits?.map((edit) => edit.path)).toEqual([join(cwd, "src/upload.ts")]);
+    expect(session.compactSummary).toContain("Outstanding User Requests");
+    expect(session.threadName).toBe("Fix the flaky upload test.");
+  });
+
+  it("matches a background command with its later status report", () => {
+    const cwd = tempDir("work");
+    const path = antigravity.conversation(env.antigravityHome, "bg", cwd, [
+      antigravity.runCommand("npm run build", undefined, "", { commandId: "cmd-7" }),
+      antigravity.commandStatus("cmd-7", 2, "error TS2304: Cannot find name 'foo'.")
+    ]);
+    expect(parseAntigravitySession(path).commands).toMatchObject([{ command: "npm run build", status: "failed", exitCode: 2 }]);
+  });
+
+  it("finds conversations through agy's index and skips subagents", () => {
+    const cwd = tempDir("work");
+    antigravity.index(env.antigravityHome, [
+      { id: "main0000-1111", title: "Fix Flaky Upload Test", workspace: cwd },
+      { id: "sub00000-2222", title: "Explore the repo", workspace: cwd, parentId: "main0000-1111" }
+    ]);
+    antigravity.conversation(env.antigravityHome, "main0000-1111", cwd, [antigravity.userInput("Fix the flaky upload test.")]);
+    antigravity.conversation(env.antigravityHome, "sub00000-2222", cwd, [antigravity.userInput("Explore the repo")], { parentId: "main0000-1111" });
+    // Not in the index yet: the conversation's own metadata names its workspace.
+    antigravity.conversation(env.antigravityHome, "fresh000-3333", tempDir("other"), [antigravity.userInput("Add dark mode")]);
+
+    const candidates = listSessionCandidates({ cwd, from: "antigravity" });
+    expect(candidates.map((candidate) => [candidate.id, candidate.matchedCwd, candidate.title])).toEqual([
+      ["main0000-1111", true, "Fix Flaky Upload Test"],
+      ["fresh000-3333", false, "Add dark mode"]
+    ]);
+    expect(resolveSessionSource({ cwd })).toMatchObject({ source: "antigravity", id: "main0000-1111", threadName: "Fix Flaky Upload Test" });
+    expect(resolveSessionSource({ cwd, session: "sub00000" }).id).toBe("sub00000-2222");
+  });
+
+  it("dates a conversation by its WAL only when the WAL holds new steps", () => {
+    const cwd = tempDir("work");
+    const path = antigravity.conversation(env.antigravityHome, "dated", cwd, [antigravity.userInput("Hello there")]);
+    // Whole seconds, so the time survives the filesystem's rounding.
+    const later = new Date(Math.floor(Date.now() / 1000) * 1000 + 60 * 60 * 1000);
+    writeFileSync(`${path}-wal`, "");
+    utimesSync(`${path}-wal`, later, later);
+    expect(listSessionCandidates({ cwd, from: "antigravity" })[0].updatedAt).toBe(statSync(path).mtime.toISOString());
+    writeFileSync(`${path}-wal`, "new steps");
+    utimesSync(`${path}-wal`, later, later);
+    expect(listSessionCandidates({ cwd, from: "antigravity" })[0].updatedAt).toBe(later.toISOString());
+  });
+
+  it("never writes next to agy's databases", () => {
+    const cwd = tempDir("work");
+    const path = antigravity.conversation(env.antigravityHome, "ro", cwd, [antigravity.userInput("Hello there")]);
+    listSessionCandidates({ cwd, from: "antigravity" });
+    resolveSessionSource({ cwd, session: path });
+    expect(readdirSync(join(env.antigravityHome, "conversations"))).toEqual(["ro.db"]);
+  });
+});
+
 describe("session discovery", () => {
   it("skips Codex subagent and reviewer threads", () => {
     const cwd = tempDir("work");
@@ -257,7 +358,7 @@ describe("session discovery", () => {
   it("explains how to recover when no session matches", () => {
     const cwd = tempDir("work");
     writeJsonl(join(env.codexHome, "sessions/a.jsonl"), [codex.meta("elsewhere", tempDir("other"))]);
-    expect(() => resolveSessionSource({ cwd })).toThrowError(/No Codex, Claude, or Gemini session found/);
+    expect(() => resolveSessionSource({ cwd })).toThrowError(/No Codex, Claude, Gemini, or Antigravity session found/);
   });
 
   it("asks which agent to use when both were just active", () => {

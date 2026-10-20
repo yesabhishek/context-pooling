@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import type { DatabaseSync } from "node:sqlite";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { CommandRun, FileEdit, PlanItem, PlanStatus, SourceAgent, SourceSession, TranscriptEntry } from "./types.js";
 import { oneLine, truncate } from "./text.js";
 import { CtxError, canonicalPath, findRecentFiles, unique } from "./util.js";
@@ -48,10 +51,18 @@ export function geminiHome(): string {
   return join(process.env.GEMINI_CLI_HOME || homedir(), ".gemini");
 }
 
-/** Every agent ContextPool can read, in the order `--from auto` lists them. */
-export const SOURCE_AGENTS: readonly SourceAgent[] = ["codex", "claude", "gemini"];
+/**
+ * Antigravity CLI (`agy`) always keeps its data in ~/.gemini/antigravity-cli. CTXPOOL_ANTIGRAVITY_DIR points
+ * ContextPool somewhere else; agy itself does not read it.
+ */
+export function antigravityHome(): string {
+  return process.env.CTXPOOL_ANTIGRAVITY_DIR || join(homedir(), ".gemini", "antigravity-cli");
+}
 
-const SOURCE_LABELS: Record<SourceAgent, string> = { codex: "Codex", claude: "Claude", gemini: "Gemini" };
+/** Every agent ContextPool can read, in the order `--from auto` lists them. */
+export const SOURCE_AGENTS: readonly SourceAgent[] = ["codex", "claude", "gemini", "antigravity"];
+
+const SOURCE_LABELS: Record<SourceAgent, string> = { codex: "Codex", claude: "Claude", gemini: "Gemini", antigravity: "Antigravity" };
 
 export function sourceLabel(source: SourceAgent): string {
   return SOURCE_LABELS[source] || source;
@@ -59,7 +70,12 @@ export function sourceLabel(source: SourceAgent): string {
 
 /** Where each agent keeps the sessions ContextPool reads. */
 export function sourceSessionDirs(): Record<SourceAgent, string> {
-  return { codex: join(codexHome(), "sessions"), claude: join(claudeHome(), "projects"), gemini: join(geminiHome(), "tmp") };
+  return {
+    codex: join(codexHome(), "sessions"),
+    claude: join(claudeHome(), "projects"),
+    gemini: join(geminiHome(), "tmp"),
+    antigravity: join(antigravityHome(), "conversations")
+  };
 }
 
 export function resolveSessionSource(options: ResolveSessionOptions): SourceSession {
@@ -140,13 +156,15 @@ function joinWords(words: readonly string[], conjunction: "and" | "or"): string 
 const CANDIDATE_FINDERS: Record<SourceAgent, (scope: Scope, includeSecondary: boolean) => SessionCandidate[]> = {
   codex: findCodexCandidates,
   claude: findClaudeCandidates,
-  gemini: findGeminiCandidates
+  gemini: findGeminiCandidates,
+  antigravity: findAntigravityCandidates
 };
 
 const SESSION_PARSERS: Record<SourceAgent, (path: string, budget?: number) => SourceSession> = {
   codex: parseCodexSession,
   claude: parseClaudeSession,
-  gemini: parseGeminiSession
+  gemini: parseGeminiSession,
+  antigravity: parseAntigravitySession
 };
 
 // ---------------------------------------------------------------------------
@@ -284,6 +302,101 @@ function geminiProjectDir(path: string): string | undefined {
   return undefined;
 }
 
+type AntigravitySummary = { cwd?: string; title?: string; parentId?: string };
+
+/**
+ * Antigravity CLI stores each conversation as a SQLite database, conversations/<id>.db, and indexes them in
+ * conversation_summaries.db. Subagent conversations name their parent there and in their own metadata.
+ */
+function findAntigravityCandidates(scope: Scope, includeSecondary: boolean): SessionCandidate[] {
+  const index = readAntigravityIndex();
+  const candidates: SessionCandidate[] = [];
+  for (const path of findRecentFiles(join(antigravityHome(), "conversations"), MAX_CANDIDATES, /\.db$/i)) {
+    const id = antigravityId(path);
+    const summary = index.get(id) || readAntigravityMetadata(path);
+    if (summary.parentId && !includeSecondary) continue;
+    candidates.push({
+      source: "antigravity",
+      path,
+      id,
+      cwd: summary.cwd,
+      updatedAt: antigravityUpdatedAt(path),
+      matchedCwd: matchesWorkspace(summary.cwd, scope),
+      title: summary.title
+    });
+  }
+  return candidates;
+}
+
+function readAntigravityIndex(): Map<string, AntigravitySummary> {
+  const index = new Map<string, AntigravitySummary>();
+  const db = openAntigravityDb(join(antigravityHome(), "conversation_summaries.db"));
+  if (!db) return index;
+  try {
+    const rows = db.prepare("SELECT conversation_id, title, workspace_uris, parent_conversation_id FROM conversation_summaries").all();
+    for (const row of rows) {
+      const workspaces = parseJson(String(row.workspace_uris ?? ""));
+      index.set(String(row.conversation_id), {
+        cwd: fileUriToPath(Array.isArray(workspaces) ? stringValue(workspaces[0]) : ""),
+        title: String(row.title ?? "") || undefined,
+        parentId: String(row.parent_conversation_id ?? "") || undefined
+      });
+    }
+  } catch {
+    // An older or newer index layout; each conversation's own metadata still names its workspace.
+  } finally {
+    db.close();
+  }
+  return index;
+}
+
+/** For conversations missing from the index: the workspace from their own metadata, titled by the first prompt still on record. */
+function readAntigravityMetadata(path: string): AntigravitySummary {
+  const db = openAntigravityDb(path);
+  if (!db) return {};
+  try {
+    const row = db.prepare("SELECT step_payload FROM steps WHERE step_type = ? AND status != ? ORDER BY idx LIMIT 1").get(AGY_STEP.userInput, AGY_STATUS.cleared);
+    const prompt = row?.step_payload instanceof Uint8Array ? antigravityPrompt(pbMessage(pbDecode(row.step_payload), 19)) : "";
+    return { ...antigravityTrajectoryMetadata(db), title: prompt ? truncate(oneLine(cleanText(prompt)), 80) : undefined };
+  } catch {
+    return antigravityTrajectoryMetadata(db);
+  } finally {
+    db.close();
+  }
+}
+
+/** The CortexTrajectoryMetadata proto: workspaces[].workspace_folder_absolute_uri (1.1), workspace_uris (7), parent_conversation_id (5). */
+function antigravityTrajectoryMetadata(db: DatabaseSync): AntigravitySummary {
+  try {
+    const row = db.prepare("SELECT data FROM trajectory_metadata_blob WHERE id = 'main'").get();
+    const metadata = pbDecode(row?.data instanceof Uint8Array ? row.data : undefined);
+    const uri = pbString(pbMessage(metadata, 1), 1) || pbString(metadata, 7);
+    return { cwd: fileUriToPath(uri), parentId: pbString(metadata, 5) || undefined };
+  } catch {
+    return {};
+  }
+}
+
+/** agy writes recent steps to the -wal file first, so it can be newer than the database. An empty one holds nothing new. */
+function antigravityUpdatedAt(path: string): string {
+  const database = statSync(path).mtime;
+  const wal = existsSync(`${path}-wal`) ? statSync(`${path}-wal`) : undefined;
+  return (wal?.size && wal.mtime > database ? wal.mtime : database).toISOString();
+}
+
+function antigravityId(path: string): string {
+  return basename(path).replace(/\.db$/i, "");
+}
+
+function fileUriToPath(uri: string): string | undefined {
+  if (!uri) return undefined;
+  try {
+    return uri.startsWith("file:") ? fileURLToPath(uri) : uri;
+  } catch {
+    return undefined;
+  }
+}
+
 function readCodexMeta(path: string): { id?: string; cwd?: string; secondary: boolean } {
   const record = objectValue(parseJson(readFirstLine(path)));
   if (stringValue(record.type) !== "session_meta") return { secondary: false };
@@ -332,8 +445,9 @@ function readCodexIndex(): Map<string, string> {
 }
 
 function detectSource(path: string): SourceAgent {
-  // Only Gemini writes a whole session as one JSON document.
+  // Only Gemini writes a whole session as one JSON document, and only Antigravity keeps one in SQLite.
   if (/\.json$/i.test(path)) return "gemini";
+  if (/\.db$/i.test(path)) return "antigravity";
   for (const line of readHead(path, 64_000).split(/\r?\n/).slice(0, 10)) {
     const record = objectValue(parseJson(line));
     if (record.type === "session_meta" || "payload" in record) return "codex";
@@ -852,6 +966,177 @@ function geminiToolOutput(call: Record<string, unknown>): string {
   return text.replace(/^Output: /, "");
 }
 
+// Field numbers below come from the protos agy embeds: gemini_coder.Step and the exa.cortex_pb step payloads.
+const AGY_STEP = { userInput: 14, plannerResponse: 15, errorMessage: 17, checkpoint: 23, commandStatus: 28 } as const;
+const AGY_STATUS = { cleared: 5, canceled: 6, error: 7 } as const;
+const AGY_EDIT_TOOLS = new Set(["replace_file_content", "multi_replace_file_content", "write_to_file"]);
+
+export function parseAntigravitySession(path: string, budget = DEFAULT_EXCERPT_TOKENS): SourceSession {
+  const db = openAntigravityDb(path);
+  if (!db) throw new CtxError(`Could not open the Antigravity conversation ${path}.`, "Check that the file exists and is readable.");
+  const builder = new SessionBuilder();
+  const id = antigravityId(path);
+  let metadata: AntigravitySummary = {};
+  let stepCount = 0;
+  let checkpointTitle: string | undefined;
+  try {
+    metadata = antigravityTrajectoryMetadata(db);
+    for (const row of db.prepare("SELECT step_payload FROM steps ORDER BY idx").all()) {
+      if (!(row.step_payload instanceof Uint8Array)) continue;
+      stepCount++;
+      checkpointTitle = readAntigravityStep(builder, pbDecode(row.step_payload)) || checkpointTitle;
+    }
+  } finally {
+    db.close();
+  }
+  const summary = readAntigravityIndex().get(id);
+  const firstPrompt = builder.transcript.find((entry) => entry.role === "user")?.text;
+  return buildSession({
+    source: "antigravity",
+    id,
+    path,
+    cwd: metadata.cwd || summary?.cwd,
+    lineCount: stepCount,
+    builder,
+    budget,
+    threadName: summary?.title || checkpointTitle || (firstPrompt ? truncate(oneLine(firstPrompt), 80) : undefined)
+  });
+}
+
+/** Feeds one gemini_coder.Step into the builder; returns a conversation title when a checkpoint carries one. */
+function readAntigravityStep(builder: SessionBuilder, step: PbMessage): string | undefined {
+  const type = pbInt(step, 1);
+  const status = pbInt(step, 4);
+  const metadata = pbMessage(step, 5);
+  const timestamp = pbTimestamp(pbMessage(metadata, 1));
+
+  // Steps that Antigravity has compacted out of context keep their metadata but lose their payload, so old
+  // prompts and replies come back empty here; the latest checkpoint summarizes them.
+  switch (type) {
+    case AGY_STEP.userInput:
+      builder.message("user", antigravityPrompt(pbMessage(step, 19)), timestamp);
+      return undefined;
+    case AGY_STEP.plannerResponse: {
+      const response = pbMessage(step, 20);
+      builder.message("assistant", pbString(response, 8) || pbString(response, 1), timestamp);
+      return undefined;
+    }
+    case AGY_STEP.checkpoint: {
+      const checkpoint = pbMessage(step, 30);
+      const summary = pbString(checkpoint, 5);
+      if (summary.trim()) builder.compactSummary = cleanText(summary);
+      return pbString(checkpoint, 10) || undefined;
+    }
+    case AGY_STEP.commandStatus: {
+      const result = pbMessage(step, 37);
+      builder.commandResult(pbString(result, 1), pbString(result, 9) || pbString(result, 3), { exitCode: pbInt(result, 5) });
+      return undefined;
+    }
+    case AGY_STEP.errorMessage:
+      // The tool call failed before it ran.
+      return undefined;
+  }
+
+  const call = pbMessage(metadata, 4);
+  const name = pbString(call, 2);
+  // System and ephemeral messages carry no tool call.
+  if (name) readAntigravityTool(builder, name, objectValue(parseJson(pbString(call, 3))), step, status, timestamp);
+  return undefined;
+}
+
+/** CortexStepUserInput: what the user sent (2), else its text items (3), else the raw query (1). */
+function antigravityPrompt(input: PbMessage): string {
+  return pbString(input, 2) || pbMessages(input, 3).map((item) => pbString(item, 1)).join("") || pbString(input, 1);
+}
+
+function readAntigravityTool(
+  builder: SessionBuilder,
+  name: string,
+  args: Record<string, unknown>,
+  step: PbMessage,
+  status: number | undefined,
+  timestamp?: string
+): void {
+  // Newer agy builds run every tool as a generic step (140) whose result carries the typed step as a google.protobuf.Any.
+  const result = pbMessage(pbMessage(step, 140), 2);
+  const resultText = pbString(result, 1);
+  const payload = pbMessage(result, 6);
+  const typed = pbString(payload, 1).endsWith("gemini_coder.Step") ? pbDecode(pbBytes(payload, 2)) : step;
+
+  if (name === "run_command") {
+    const run = pbMessage(typed, 28);
+    const command = stringValue(args.CommandLine) || pbString(run, 23) || pbString(run, 1);
+    if (status === AGY_STATUS.canceled || pbInt(run, 14) === 1 || /^Encountered error in step execution: context canceled/.test(resultText.trim())) {
+      builder.toolCall("Shell", `${command} (cancelled)`, timestamp);
+      return;
+    }
+    const exitCode = pbInt(run, 6) ?? numberFromMatch(/exited with code (-?\d+)/.exec(resultText)) ?? (status === AGY_STATUS.error ? 1 : undefined);
+    const output = pbString(pbMessage(run, 21), 1) || resultText;
+    const commandId = pbString(run, 13);
+    // A command that went to the background reports its exit code in a later command_status step.
+    if (exitCode === undefined && commandId && status !== AGY_STATUS.cleared) builder.commandCall(commandId, command, timestamp);
+    else builder.command(command, exitCode, output, timestamp);
+    return;
+  }
+  if (AGY_EDIT_TOOLS.has(name)) {
+    const file = stringValue(args.TargetFile);
+    // Plans and walkthroughs that agy writes to its own brain folder are not repo edits.
+    if (file && status !== AGY_STATUS.canceled && status !== AGY_STATUS.error && !isInside(resolve(file), resolve(antigravityHome()))) builder.edit(file, timestamp);
+    return;
+  }
+  const detail =
+    stringValue(args.AbsolutePath) || stringValue(args.DirectoryPath) || stringValue(args.SearchPath) || stringValue(args.Query) || stringValue(args.query) || stringValue(args.Url);
+  builder.toolCall(name, detail, timestamp);
+}
+
+function numberFromMatch(match: RegExpExecArray | null): number | undefined {
+  return match ? Number(match[1]) : undefined;
+}
+
+const requireBuiltin = createRequire(import.meta.url);
+let sqliteModule: typeof import("node:sqlite") | undefined;
+
+/** node:sqlite prints an ExperimentalWarning on load in Node 22; keep CLI output clean. */
+function loadSqlite(): typeof import("node:sqlite") {
+  if (sqliteModule) return sqliteModule;
+  const emitWarning = process.emitWarning;
+  process.emitWarning = ((warning: string | Error, ...rest: unknown[]) => {
+    const message = typeof warning === "string" ? warning : warning.message;
+    if (/SQLite is an experimental feature/i.test(message)) return;
+    return (emitWarning as (...args: unknown[]) => void).call(process, warning, ...rest);
+  }) as typeof process.emitWarning;
+  try {
+    sqliteModule = requireBuiltin("node:sqlite") as typeof import("node:sqlite");
+    return sqliteModule;
+  } finally {
+    process.emitWarning = emitWarning;
+  }
+}
+
+/**
+ * Opens an Antigravity database without changing anything next to it. A running agy keeps its newest steps in the
+ * -wal file, so read through it while agy has it open. Otherwise open the file as immutable: a plain read-only open
+ * of a WAL database would create -wal and -shm files in agy's folder.
+ */
+function openAntigravityDb(path: string): DatabaseSync | undefined {
+  if (!existsSync(path)) return undefined;
+  const { DatabaseSync } = loadSqlite();
+  if (existsSync(`${path}-wal`) && existsSync(`${path}-shm`)) {
+    try {
+      return new DatabaseSync(path, { readOnly: true });
+    } catch {
+      // Fall back to the last checkpointed state.
+    }
+  }
+  try {
+    const url = pathToFileURL(path);
+    url.searchParams.set("immutable", "1");
+    return new DatabaseSync(url, { readOnly: true });
+  } catch {
+    return undefined;
+  }
+}
+
 function buildSession(args: {
   source: SourceAgent;
   id: string;
@@ -1052,6 +1337,88 @@ function parseJson(line: string): unknown {
 
 function mtimeIso(path: string): string {
   return statSync(path).mtime.toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// Protobuf wire format, enough to read Antigravity's stored steps without its schema files
+
+type PbMessage = Map<number, (bigint | Uint8Array)[]>;
+
+const utf8 = new TextDecoder();
+
+/** One level of a serialized message. Nested messages stay as bytes until asked for; a malformed tail is dropped. */
+function pbDecode(bytes: Uint8Array | undefined): PbMessage {
+  const fields: PbMessage = new Map();
+  if (!bytes) return fields;
+  let offset = 0;
+  const varint = (): bigint => {
+    let value = 0n;
+    for (let shift = 0n; offset < bytes.length; shift += 7n) {
+      const byte = bytes[offset++];
+      value |= BigInt(byte & 0x7f) << shift;
+      if (byte < 0x80) return value;
+    }
+    throw new Error("truncated varint");
+  };
+  try {
+    while (offset < bytes.length) {
+      const key = varint();
+      const field = Number(key >> 3n);
+      const wire = Number(key & 7n);
+      let value: bigint | Uint8Array;
+      if (wire === 0) {
+        value = varint();
+      } else if (wire === 2) {
+        const length = Number(varint());
+        if (offset + length > bytes.length) break;
+        value = bytes.subarray(offset, offset + length);
+        offset += length;
+      } else if (wire === 1 || wire === 5) {
+        offset += wire === 1 ? 8 : 4;
+        continue;
+      } else {
+        break;
+      }
+      const values = fields.get(field);
+      if (values) values.push(value);
+      else fields.set(field, [value]);
+    }
+  } catch {
+    // Keep the fields read so far.
+  }
+  return fields;
+}
+
+function pbBytes(message: PbMessage, field: number): Uint8Array | undefined {
+  const value = message.get(field)?.at(-1);
+  return value instanceof Uint8Array ? value : undefined;
+}
+
+function pbString(message: PbMessage, field: number): string {
+  const bytes = pbBytes(message, field);
+  return bytes ? utf8.decode(bytes) : "";
+}
+
+function pbMessage(message: PbMessage, field: number): PbMessage {
+  return pbDecode(pbBytes(message, field));
+}
+
+function pbMessages(message: PbMessage, field: number): PbMessage[] {
+  return (message.get(field) || []).filter((value): value is Uint8Array => value instanceof Uint8Array).map(pbDecode);
+}
+
+/** An int32/enum/bool field; undefined when absent. */
+function pbInt(message: PbMessage, field: number): number | undefined {
+  const value = message.get(field)?.at(-1);
+  return typeof value === "bigint" ? Number(BigInt.asIntN(32, value)) : undefined;
+}
+
+/** A google.protobuf.Timestamp as an ISO string. */
+function pbTimestamp(timestamp: PbMessage): string | undefined {
+  const seconds = timestamp.get(1)?.at(-1);
+  if (typeof seconds !== "bigint") return undefined;
+  const nanos = timestamp.get(2)?.at(-1);
+  return new Date(Number(seconds) * 1000 + (typeof nanos === "bigint" ? Number(nanos) / 1e6 : 0)).toISOString();
 }
 
 // ---------------------------------------------------------------------------

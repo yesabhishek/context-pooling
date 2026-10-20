@@ -1,8 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+Antigravity CLI joins Codex, Claude, and Gemini as a handoff source. Upgrading from 0.1.x? Read 0.3.0 and 0.2.0 too; 0.2.0 has breaking changes.
+
+### Added
+
+- **Antigravity CLI sessions** are a handoff source. ContextPool reads `agy`'s conversation databases in `~/.gemini/antigravity-cli/conversations` without writing to them, decoding each step with the field numbers from the protos `agy` ships. It reads your prompts, the agent's replies, shell commands with exit codes (including background commands that report later), file edits, and the latest checkpoint summary, which covers turns `agy` has compacted. Titles and workspaces come from `agy`'s conversation index, and subagent conversations are skipped. Older conversations saved as opaque `.pb` files are skipped. Set `CTXPOOL_ANTIGRAVITY_DIR` to read another folder.
+- `--from antigravity`, and an Antigravity line in `ctxpool status`.
+
 ## 0.3.0
 
-Gemini CLI joins Codex and Claude as a handoff source. This is the first npm release since 0.1.1, so it also ships everything listed under 0.2.0, including its breaking changes.
+Gemini CLI joins Codex and Claude as a handoff source. Upgrading from 0.1.x? This release also includes everything under 0.2.0, including its breaking changes.
 
 ### Added
 

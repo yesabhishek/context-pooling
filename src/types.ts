@@ -143,7 +143,7 @@ export type AgentSignal = {
   snippets: string[];
 };
 
-export type SourceAgent = "codex" | "claude" | "gemini";
+export type SourceAgent = "codex" | "claude" | "gemini" | "antigravity";
 
 export type TranscriptEntry = {
   role: "user" | "assistant" | "tool" | "system";

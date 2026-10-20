@@ -19,7 +19,7 @@ const program = new Command();
 
 program
   .name("ctxpool")
-  .description("Hand off AI coding sessions between Codex, Claude, Gemini, and any MCP-capable agent.")
+  .description("Hand off AI coding sessions between Codex, Claude, Gemini, Antigravity, and any MCP-capable agent.")
   .version(VERSION, "-v, --version", "Show the version")
   .helpOption("-h, --help", "Show help")
   .helpCommand(false)
@@ -103,7 +103,7 @@ program
 
 program
   .command("sessions")
-  .description("List the Codex, Claude, and Gemini sessions ContextPool can read")
+  .description("List the Codex, Claude, Gemini, and Antigravity sessions ContextPool can read")
   .addOption(fromOption())
   .option("--all", "Include sessions from other folders")
   .option("-n, --limit <count>", "How many to show", positiveInt, 10)
@@ -150,7 +150,7 @@ program
     withStore((store) => {
       const tasks = store.listTasks();
       if (options.json) return printJson(tasks);
-      if (!tasks.length) return print([heading("No handoffs yet"), "", note("Run `ctxpool handoff` in a repo where you've used Codex, Claude, or Gemini.")]);
+      if (!tasks.length) return print([heading("No handoffs yet"), "", note("Run `ctxpool handoff` in a repo where you've used Codex, Claude, Gemini, or Antigravity.")]);
       print([
         heading("Tasks"),
         "",
@@ -206,7 +206,7 @@ program
     withStore(() => {
       const paths = ensureCtxDirs();
       if (!existsSync(paths.configPath)) writeFileSync(paths.configPath, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, { mode: 0o600 });
-      print([line(`${glyph.ok} ContextPool is ready`), note(`  ${tildePath(paths.home)}`), "", note("Next: run `ctxpool handoff` in a repo where you've used Codex, Claude, or Gemini.")]);
+      print([line(`${glyph.ok} ContextPool is ready`), note(`  ${tildePath(paths.home)}`), "", note("Next: run `ctxpool handoff` in a repo where you've used Codex, Claude, Gemini, or Antigravity.")]);
     })
   );
 

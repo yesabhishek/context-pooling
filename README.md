@@ -2,7 +2,7 @@
 
 Hand off AI coding sessions between agents without losing the thread.
 
-ContextPool reads the Codex, Claude Code, or Gemini CLI session you just worked in, pairs it with the repo's git state, and writes a short handoff the next agent can act on: what was asked, the plan, which checks passed or failed, what changed, and the next action. Everything stays on your machine.
+ContextPool reads the Codex, Claude Code, Gemini CLI, or Antigravity CLI session you just worked in, pairs it with the repo's git state, and writes a short handoff the next agent can act on: what was asked, the plan, which checks passed or failed, what changed, and the next action. Everything stays on your machine.
 
 ```sh
 npm install -g ctxpool
@@ -40,8 +40,9 @@ Paste it into the next agent, or let the agent fetch it over MCP.
 | Codex | `~/.codex/sessions` |
 | Claude Code | `~/.claude/projects` |
 | Gemini CLI | `~/.gemini/tmp/<project>/chats` |
+| Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/conversations` |
 
-Cursor isn't supported yet.
+Antigravity keeps each conversation in a SQLite database. ContextPool opens it without writing anything, and reads steps that `agy` has compacted out of context through the latest checkpoint summary. Older conversations saved as `.pb` files use an opaque format and are skipped. Cursor isn't supported yet.
 
 ## Commands
 
@@ -114,6 +115,7 @@ Set `ollama.enabled` (or pass `--ollama`) to have a local Ollama model phrase th
 | `CODEX_HOME` | Codex data (default `~/.codex`) |
 | `CLAUDE_CONFIG_DIR` | Claude Code data (default `~/.claude`) |
 | `GEMINI_CLI_HOME` | Folder that holds Gemini CLI's `.gemini` directory (default your home folder) |
+| `CTXPOOL_ANTIGRAVITY_DIR` | Antigravity CLI data for ContextPool to read (default `~/.gemini/antigravity-cli`). `agy` itself ignores it. |
 | `CTXPOOL_EDITOR` | Editor command for "open file" in the UI |
 | `NO_COLOR` | Plain terminal output |
 
