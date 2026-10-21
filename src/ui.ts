@@ -4,12 +4,14 @@ import { networkInterfaces } from "node:os";
 import { spawnSync } from "node:child_process";
 import { dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { buildAgentContext, buildTeamTimelineExport, deriveContextBlocks } from "./handoff.js";
+import { buildAgentContext, buildTeamTimelineExport, deriveContextBlocks, summarizeHandoff } from "./handoff.js";
 import { createContextPack, renderContextPackOutput } from "./pack.js";
 import { redactSecrets } from "./redact.js";
+import { SOURCE_AGENTS, sourceSessionDirs } from "./session.js";
 import { openStore } from "./store.js";
-import type { ContextBlock, ContextPack } from "./types.js";
+import type { ContextBlock, ContextPack, SourceAgent, UiStatus } from "./types.js";
 import { CtxError } from "./util.js";
+import { VERSION } from "./version.js";
 
 const MAX_FILE_VIEW_BYTES = 512 * 1024;
 const MAX_JSON_BODY_BYTES = 2 * 1024 * 1024;
@@ -106,14 +108,26 @@ async function handle(req: IncomingMessage, res: ServerResponse, allowedHosts: S
   const path = url.pathname;
   const param = (prefix: string, suffix = "") => decodeURIComponent(path.slice(prefix.length, suffix ? -suffix.length : undefined));
 
+  if (path === "/api/status") return withStore((store) => sendJson(res, 200, uiStatus(store.getStatus())));
+
   if (path === "/api/tasks") return withStore((store) => sendJson(res, 200, { tasks: store.listTasks() }));
 
   if (path === "/api/handoffs") {
-    return withStore((store) => sendJson(res, 200, { handoffs: store.listHandoffPackets(url.searchParams.get("task") || undefined) }));
+    return withStore((store) => {
+      const packets = store.listHandoffPackets(url.searchParams.get("task") || undefined);
+      // The list view only needs the compact summary; full packets carry transcripts and diffs.
+      sendJson(res, 200, { handoffs: url.searchParams.get("view") === "list" ? packets.map(summarizeHandoff) : packets });
+    });
   }
 
   if (path === "/api/context-blocks") {
-    return withStore((store) => sendJson(res, 200, { blocks: store.listHandoffPackets(url.searchParams.get("task") || undefined).flatMap(deriveContextBlocks) }));
+    return withStore((store) => {
+      const handoffId = url.searchParams.get("handoff");
+      const handoff = handoffId ? store.getHandoffById(handoffId) : undefined;
+      if (handoffId && !handoff) return sendJson(res, 404, { error: "Handoff not found" });
+      const packets = handoff ? [handoff] : store.listHandoffPackets(url.searchParams.get("task") || undefined);
+      sendJson(res, 200, { blocks: packets.flatMap(deriveContextBlocks) });
+    });
   }
 
   if (path === "/api/context-packs") {
@@ -213,6 +227,19 @@ async function handle(req: IncomingMessage, res: ServerResponse, allowedHosts: S
   if (method !== "GET" && method !== "HEAD") return sendJson(res, 405, { error: "Use GET" });
   if (trySendStaticAsset(path, res)) return;
   return sendWebApp(res);
+}
+
+function uiStatus(status: ReturnType<Awaited<ReturnType<typeof openStore>>["getStatus"]>): UiStatus {
+  const dirs = sourceSessionDirs();
+  return {
+    version: VERSION,
+    home: status.home,
+    handoffCount: status.handoffCount,
+    taskCount: status.taskCount,
+    packCount: status.packCount,
+    latestAt: status.latestAt,
+    agents: Object.fromEntries(SOURCE_AGENTS.map((source) => [source, existsSync(dirs[source])])) as Record<SourceAgent, boolean>
+  };
 }
 
 async function withStore(fn: (store: Awaited<ReturnType<typeof openStore>>) => void): Promise<void> {

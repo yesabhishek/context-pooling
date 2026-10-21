@@ -2,7 +2,23 @@ import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { isLocalRequest, isValidContextPackBody, readRepoFileForView, startUi, type RunningUi } from "./ui.js";
+import { openStore } from "./store.js";
 import { isolateEnv, tempDir } from "./test-helpers.js";
+import type { HandoffPacket } from "./types.js";
+
+function packet(id: string, task: string): HandoffPacket {
+  const sections = { goal: "", currentStatus: [], completed: [], inProgress: [], todos: [], blockers: [], filesTouched: [], commandsRun: [], errors: [], decisions: [], doNotRepeat: [], nextBestAction: "Ship it." };
+  return {
+    id,
+    task,
+    createdAt: id === "h1" ? "2026-10-19T00:00:01.000Z" : "2026-10-19T00:00:02.000Z",
+    repo: { repoPath: "/tmp/repo", isGitRepo: true, branch: "main", commit: "abc1234", dirtyFiles: [], diffStat: "", diffPatch: "", diffPatchTruncated: false, recentCommits: [] },
+    sources: [],
+    sections,
+    markdown: `# Handoff: ${task}`,
+    markdownPath: ""
+  };
+}
 
 describe("file preview", () => {
   it("reads text files and redacts .env values", () => {
@@ -94,6 +110,32 @@ describe("server", () => {
     const formPost = await request("/api/context-packs", { method: "POST", headers: { "content-type": "text/plain" }, body: "{}" });
     const badJson = await request("/api/context-packs", { method: "POST", headers: { "content-type": "application/json" }, body: "{" });
     expect([crossOrigin.status, formPost.status, badJson.status]).toEqual([403, 415, 400]);
+  });
+
+  it("reports status for the UI to poll", async () => {
+    const status = (await (await request("/api/status")).json()) as Record<string, unknown>;
+    expect(status).toMatchObject({ handoffCount: 0, taskCount: 0, agents: { codex: false, claude: false, gemini: false, antigravity: false } });
+    expect(typeof status.version).toBe("string");
+  });
+
+  it("lists handoff summaries and blocks for one handoff", async () => {
+    const store = await openStore();
+    store.saveHandoff(packet("h1", "billing"));
+    store.saveHandoff(packet("h2", "search"));
+    store.close();
+
+    const list = (await (await request("/api/handoffs?view=list")).json()) as { handoffs: Record<string, unknown>[] };
+    expect(list.handoffs.map((item) => item.id)).toEqual(["h2", "h1"]);
+    expect(list.handoffs[0]).toMatchObject({ task: "search", repoName: "repo", nextAction: "Ship it." });
+    expect(list.handoffs[0]).not.toHaveProperty("markdown");
+
+    const blocks = (await (await request("/api/context-blocks?handoff=h1")).json()) as { blocks: { sourceHandoffId: string }[] };
+    expect(blocks.blocks.length).toBeGreaterThan(0);
+    expect(new Set(blocks.blocks.map((block) => block.sourceHandoffId))).toEqual(new Set(["h1"]));
+    expect((await request("/api/context-blocks?handoff=missing")).status).toBe(404);
+
+    const status = (await (await request("/api/status")).json()) as { handoffCount: number; latestAt: string };
+    expect(status).toMatchObject({ handoffCount: 2, latestAt: "2026-10-19T00:00:02.000Z" });
   });
 
   it("creates and deletes a pack", async () => {

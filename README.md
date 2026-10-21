@@ -52,8 +52,8 @@ Antigravity keeps each conversation in a SQLite database. ContextPool opens it w
 | `ctxpool capture` | Same, without the clipboard |
 | `ctxpool sessions` | List the sessions ContextPool can read here (`--all` for every folder) |
 | `ctxpool tasks` | List tasks with saved handoffs |
-| `ctxpool show [task]` | Print the latest handoff (for a task) |
-| `ctxpool ui` | Open the context pack builder in your browser |
+| `ctxpool show [task]` | Print the latest handoff (for a task), or one by `--id` |
+| `ctxpool ui` | Browse handoffs, activity charts, and context packs in your browser |
 | `ctxpool team export` | Write a redacted, sync-ready JSON packet |
 | `ctxpool mcp start` | Serve handoffs to agents over MCP (stdio) |
 | `ctxpool status` | Show where data lives and which agents were found |
@@ -91,9 +91,24 @@ All tools are read-only.
 | `list_context_packs` | Saved context packs |
 | `get_context_pack` | A context pack as markdown or JSON |
 
+## The web UI
+
+```sh
+ctxpool ui --open
+```
+
+A local dashboard for everything you've handed off, served from `127.0.0.1:4377`:
+
+- **Overview**: the latest handoff with its next action, handoffs over time by agent, how tasks moved between agents, which checks were passing at handoff, and the files that keep coming back.
+- **Handoffs**: every capture, newest first, with the source agent's logo, repo and branch, checks, and diff size. Filter by agent, task, or check status.
+- **Handoff detail**: the next action, objective, plan progress, each check with its exit code, changed files with diffs, the transcript, and the exact markdown that was copied. **Continue in** copies a command that starts Claude Code, Codex, or Gemini CLI with the handoff as its first prompt.
+- **Connect agents**: the MCP setup command for each agent, and which agents' session folders were found on this machine.
+
+New handoffs appear without a reload. Press <kbd>⌘K</kbd> to jump to any handoff, task, or pack.
+
 ## Context packs
 
-`ctxpool ui` turns saved handoffs into blocks (objectives, decisions, constraints, checks, changed files) that you can arrange into a reusable prompt. Transcript blocks are left out of exports unless you turn on **Include transcript** for that pack.
+A pack combines the parts of several handoffs that still matter (objectives, decisions, constraints, checks, changed files) into one reusable prompt. Open a handoff and choose **Add to pack**, or start a pack and add blocks from any handoff. Packs save as you edit, and agents can read them over MCP with `get_context_pack`. Transcript blocks are left out of exports unless you turn on **Include transcript** for that pack.
 
 ## Configuration
 
@@ -126,6 +141,8 @@ Set `ollama.enabled` (or pass `--ollama`) to have a local Ollama model phrase th
 - The UI binds to `127.0.0.1`. It rejects requests addressed to other hostnames (DNS rebinding), cross-origin writes, and non-JSON writes. File previews are limited to repositories in saved handoffs and do not follow symlinks out of them.
 
 Report security issues privately; see [SECURITY.md](SECURITY.md).
+
+Agent logos in the UI are trademarks of their owners and are shown only to identify where a session came from. The UI uses the Geist typeface (SIL Open Font License).
 
 ## Development
 

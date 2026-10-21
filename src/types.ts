@@ -259,6 +259,43 @@ export type HandoffSummary = {
   status: string[];
 };
 
+/** Compact view of a handoff for the web UI's lists and charts. */
+export type HandoffListItem = {
+  id: string;
+  task: string;
+  createdAt: string;
+  title?: string;
+  source?: SourceAgent;
+  sessionId?: string;
+  targetAgent?: string;
+  repoPath: string;
+  repoName: string;
+  branch: string;
+  commit: string;
+  isGitRepo: boolean;
+  phase: WorkPhase;
+  objective: string;
+  nextAction: string;
+  verification: VerificationStatus;
+  checks: { passed: number; failed: number; unknown: number };
+  plan: { total: number; completed: number; inProgress: number };
+  files: { count: number; additions: number; deletions: number; paths: string[] };
+  blockers: number;
+  tokens: number;
+  transcriptItems: number;
+};
+
+export type UiStatus = {
+  version: string;
+  home: string;
+  handoffCount: number;
+  taskCount: number;
+  packCount: number;
+  /** Newest handoff time; the UI polls this to pick up new captures. */
+  latestAt?: string;
+  agents: Record<SourceAgent, boolean>;
+};
+
 export type ContextBlockCategory =
   | "intent"
   | "instruction"

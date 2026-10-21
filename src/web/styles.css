@@ -2,66 +2,106 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+@font-face {
+  font-family: "Geist";
+  src: url("./assets/fonts/Geist-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("./assets/fonts/GeistMono-Variable.woff2") format("woff2");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
 @theme inline {
-  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", Inter, Helvetica, Arial, sans-serif;
-  --font-serif: "Iowan Old Style", "Charter", "Source Serif 4", "Source Serif Pro", ui-serif, Georgia, serif;
-  --font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  --font-sans: "Geist", ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --color-sidebar: var(--sidebar);
+  --color-subtle: var(--subtle);
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
   --color-faint: var(--faint);
   --color-hover: var(--hover);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-ring: var(--ring);
   --color-ink: var(--ink);
   --color-ink-foreground: var(--ink-foreground);
-  --color-green: var(--green);
-  --color-red: var(--red);
-  --color-amber: var(--amber);
-  --color-blue: var(--blue);
-  --color-purple: var(--purple);
+  --color-accent: var(--accent);
+  --color-good: var(--good);
+  --color-bad: var(--bad);
+  --color-warn: var(--warn);
+  --color-grid: var(--grid);
+  --color-axis: var(--axis);
+  --color-agent-codex: var(--agent-codex);
+  --color-agent-claude: var(--agent-claude);
+  --color-agent-gemini: var(--agent-gemini);
+  --color-agent-antigravity: var(--agent-antigravity);
+  --color-agent-unknown: var(--agent-unknown);
 }
 
+/*
+ * Neutral zinc chrome so the agents' own brand marks carry the color.
+ * Agent series colors are validated for stacked charts on both surfaces (see dataviz palette check).
+ */
 :root {
   color-scheme: light;
   --background: #ffffff;
-  --foreground: #37352f;
-  --sidebar: #f7f7f5;
-  --muted: #f1f1ef;
-  --muted-foreground: #787774;
-  --faint: #a5a29c;
-  --hover: rgba(55, 53, 47, 0.06);
-  --border: rgba(55, 53, 47, 0.1);
-  --ring: rgba(35, 131, 226, 0.45);
-  --ink: #2f2e2b;
+  --foreground: #18181b;
+  --subtle: #fafafa;
+  --muted: #f4f4f5;
+  --muted-foreground: #5f5f68;
+  --faint: #9a9aa3;
+  --hover: rgba(24, 24, 27, 0.045);
+  --border: #e9e9ec;
+  --border-strong: #d9d9de;
+  --ring: rgba(37, 99, 235, 0.5);
+  --ink: #18181b;
   --ink-foreground: #ffffff;
-  --green: #448361;
-  --red: #c4554d;
-  --amber: #b07a24;
-  --blue: #337ea9;
-  --purple: #8a67ab;
+  --accent: #2563eb;
+  --good: #16803c;
+  --bad: #d12f2f;
+  --warn: #b25d00;
+  --grid: #f0f0f2;
+  --axis: #d9d9de;
+  --agent-codex: #6250d6;
+  --agent-claude: #eb6834;
+  --agent-gemini: #2a78d6;
+  --agent-antigravity: #1baf7a;
+  --agent-unknown: #9a9aa3;
 }
 
 .dark {
   color-scheme: dark;
-  --background: #191919;
-  --foreground: rgba(255, 255, 255, 0.86);
-  --sidebar: #202020;
-  --muted: #252525;
-  --muted-foreground: #9b9b9b;
-  --faint: #6f6f6f;
-  --hover: rgba(255, 255, 255, 0.055);
-  --border: rgba(255, 255, 255, 0.09);
-  --ring: rgba(82, 156, 230, 0.55);
-  --ink: #ededec;
-  --ink-foreground: #191919;
-  --green: #4dab9a;
-  --red: #df5452;
-  --amber: #ca9849;
-  --blue: #529cca;
-  --purple: #9a6dd7;
+  --background: #131315;
+  --foreground: #ededef;
+  --subtle: #0f0f11;
+  --muted: #1c1c1f;
+  --muted-foreground: #a3a3ad;
+  --faint: #6c6c75;
+  --hover: rgba(255, 255, 255, 0.05);
+  --border: #232327;
+  --border-strong: #303036;
+  --ring: rgba(96, 145, 255, 0.6);
+  --ink: #ededef;
+  --ink-foreground: #131315;
+  --accent: #6b9bff;
+  --good: #3ccb6c;
+  --bad: #f06363;
+  --warn: #f0a83a;
+  --grid: #1d1d21;
+  --axis: #303036;
+  --agent-codex: #9085e9;
+  --agent-claude: #d95926;
+  --agent-gemini: #3987e5;
+  --agent-antigravity: #199e70;
+  --agent-unknown: #6c6c75;
 }
 
 @layer base {
@@ -90,13 +130,18 @@
     color: inherit;
   }
 
+  button:not(:disabled) {
+    cursor: pointer;
+  }
+
   pre,
-  code {
+  code,
+  kbd {
     font-family: var(--font-mono);
   }
 
   ::selection {
-    background: rgba(35, 131, 226, 0.22);
+    background: rgba(37, 99, 235, 0.2);
   }
 
   :focus-visible {
@@ -106,8 +151,29 @@
 
   * {
     scrollbar-width: thin;
-    scrollbar-color: var(--border) transparent;
+    scrollbar-color: var(--border-strong) transparent;
   }
+}
+
+@layer utilities {
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.animate-pop-in {
+  animation: pop-in 140ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 @media (prefers-reduced-motion: reduce) {

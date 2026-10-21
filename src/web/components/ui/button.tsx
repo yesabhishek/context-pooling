@@ -3,21 +3,23 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "@/lib/utils";
 
 const buttonVariants = cva(
-  "inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-md text-[13px] font-medium transition-colors select-none disabled:pointer-events-none disabled:opacity-40 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0",
+  "inline-flex shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-md font-medium transition-[background-color,border-color,color,opacity] select-none disabled:pointer-events-none disabled:opacity-40 [&_svg]:pointer-events-none [&_svg]:shrink-0",
   {
     variants: {
       variant: {
-        default: "bg-ink text-ink-foreground hover:opacity-90",
+        primary: "bg-ink text-ink-foreground hover:opacity-85",
+        secondary: "border border-border-strong bg-background text-foreground shadow-[0_1px_0_rgba(0,0,0,0.03)] hover:bg-hover",
         ghost: "text-muted-foreground hover:bg-hover hover:text-foreground",
-        outline: "border border-border text-foreground hover:bg-hover"
+        danger: "text-bad hover:bg-bad/10"
       },
       size: {
-        default: "h-8 px-3",
-        sm: "h-7 px-2",
-        icon: "size-7"
+        sm: "h-7 px-2 text-[12.5px] [&_svg]:size-3.5",
+        md: "h-8 px-3 text-[13px] [&_svg]:size-4",
+        icon: "size-7 [&_svg]:size-4",
+        "icon-sm": "size-6 [&_svg]:size-3.5"
       }
     },
-    defaultVariants: { variant: "ghost", size: "default" }
+    defaultVariants: { variant: "ghost", size: "md" }
   }
 );
 
@@ -27,3 +29,8 @@ export const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(({ classN
   <button ref={ref} type={type} className={cn(buttonVariants({ variant, size, className }))} {...props} />
 ));
 Button.displayName = "Button";
+
+export const IconButton = React.forwardRef<HTMLButtonElement, ButtonProps & { label: string }>(({ label, className, size = "icon", ...props }, ref) => (
+  <Button ref={ref} aria-label={label} title={label} size={size} className={className} {...props} />
+));
+IconButton.displayName = "IconButton";

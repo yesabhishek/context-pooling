@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.5.0
+
+The web UI is rebuilt around handoffs instead of the pack editor.
+
+### Added
+
+- **Overview dashboard**: the latest handoff and its next action, handoffs over time stacked by agent, a relay view of how each task moved between agents, check outcomes at handoff, and the most-handed-off files. Filter by 7, 30, or 90 days, or all time.
+- **Handoffs list** with each source agent's logo, repo, branch and commit, checks, diff size, and phase, grouped by day. Filter by agent, task, or check status, or search.
+- **Handoff detail** with tabs for the overview (next action, objective, plan progress, checks with exit codes, decisions, constraints, blockers), changed files with diffs, the transcript, and the exact markdown that was copied. A session activity strip shows edits and command runs in order, so checks that passed before the last edit stand out.
+- **Continue in**: copies a command that starts Claude Code, Codex, or Gemini CLI with the handoff as the first prompt, or a prompt for any agent connected over MCP.
+- **Connect agents** page with MCP setup for Claude Code, Codex, Gemini CLI, and Cursor, and which agents' session folders exist on this machine.
+- <kbd>⌘K</kbd> search across handoffs, tasks, and packs. New handoffs appear without a reload.
+- `ctxpool show --id <id>` prints a specific handoff.
+- `/api/status` and `/api/handoffs?view=list` for the UI, and `/api/context-blocks?handoff=<id>`.
+
+### Changed
+
+- **Context packs** group blocks the way they export, save as you edit, show where their tokens go, and take blocks from a handoff through **Add to pack**.
+- Handoffs saved before 0.2 no longer show injected harness text (environment context, AGENTS.md, system reminders) as the objective, decisions, or constraints.
+- Light, dark, and system themes, and a layout that works on phones.
+- Copy buttons fall back to a legacy copy when the Clipboard API is unavailable, such as when the UI is opened from another device with `--host 0.0.0.0`.
+
 ## 0.4.0
 
 Antigravity CLI joins Codex, Claude, and Gemini as a handoff source. Upgrading from 0.1.x? Read 0.3.0 and 0.2.0 too; 0.2.0 has breaking changes.

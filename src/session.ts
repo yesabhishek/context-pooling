@@ -1215,6 +1215,18 @@ function cleanText(text: string): string {
   return next.replace(/"encrypted_content":"[^"]+"/g, "").replace(/\n{3,}/g, "\n\n").trim();
 }
 
+/**
+ * Strip injected harness text (environment context, AGENTS.md, system reminders) from a transcript.
+ * Sessions parsed today are already clean; packets saved before v0.2 kept it as user messages.
+ */
+export function cleanTranscriptEntries(entries: TranscriptEntry[]): TranscriptEntry[] {
+  return entries.flatMap((entry) => {
+    if (entry.role === "tool") return [entry];
+    const text = cleanText(entry.text);
+    return isUsefulText(text) ? [{ ...entry, text }] : [];
+  });
+}
+
 function isUsefulText(text: string): boolean {
   if (!text || text.length < 2) return false;
   if (/^(?:# AGENTS\.md instructions|# Handoff[:\s·]|<environment_context>|<user_instructions>|<turn_aborted>)/.test(text)) return false;

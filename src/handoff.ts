@@ -9,6 +9,7 @@ import type {
   FileChange,
   GitSnapshot,
   HandoffContinuitySummary,
+  HandoffListItem,
   HandoffPacket,
   HandoffSections,
   MemoryFact,
@@ -22,7 +23,7 @@ import type {
 import { ensureCtxDirs } from "./paths.js";
 import { redactDeep, redactSecrets } from "./redact.js";
 import { captureGitSnapshot, inferTaskName } from "./repo.js";
-import { resolveSessionSource, sourceLabel, type SessionFrom } from "./session.js";
+import { cleanTranscriptEntries, resolveSessionSource, sourceLabel, type SessionFrom } from "./session.js";
 import { estimateTokens, oneLine, truncate } from "./text.js";
 import { canonicalPath, hashText, limit, slugify, unique } from "./util.js";
 import { isVerificationCommand, verificationKey, verificationLabel } from "./verify.js";
@@ -360,7 +361,8 @@ function withRepoRelativeEdits(session: SourceSession, repoPath: string): Source
 // ---------------------------------------------------------------------------
 // Normalization (packets saved by older versions)
 
-export function normalizeHandoffPacket(packet: HandoffPacket): HandoffPacket {
+export function normalizeHandoffPacket(input: HandoffPacket): HandoffPacket {
+  const packet = input.handoffSummary ? input : cleanLegacyPacket(input);
   const repo = {
     ...packet.repo,
     fileChanges: packet.repo.fileChanges?.length ? packet.repo.fileChanges : legacyFileChanges(packet.repo.dirtyFiles || [])
@@ -381,6 +383,60 @@ export function normalizeHandoffPacket(packet: HandoffPacket): HandoffPacket {
     : derived;
   const engineeringMemory = packet.engineeringMemory || buildEngineeringMemory(packet.task, repo, packet.sourceSession, packet.id, handoffSummary);
   return { ...packet, repo, handoffSummary, engineeringMemory };
+}
+
+/** Packets saved before v0.2 kept injected harness text as user messages; re-read them without it. */
+function cleanLegacyPacket(packet: HandoffPacket): HandoffPacket {
+  if (!packet.sourceSession) return packet;
+  const sourceSession = { ...packet.sourceSession, transcript: cleanTranscriptEntries(packet.sourceSession.transcript) };
+  const sections = buildSections(packet.task, packet.repo.dirtyFiles || [], packet.repo.diffStat || "", sourceSession);
+  return { ...packet, sourceSession, sections };
+}
+
+/** The compact shape the web UI lists and charts. */
+export function summarizeHandoff(packet: HandoffPacket): HandoffListItem {
+  const normalized = normalizeHandoffPacket(packet);
+  const summary = normalized.handoffSummary!;
+  const commands = summary.verification.commands;
+  const plan = summary.plan || [];
+  const changes = summary.fileChanges;
+  return {
+    id: normalized.id,
+    task: normalized.task,
+    createdAt: normalized.createdAt,
+    title: summary.title,
+    source: summary.sourceSession?.source,
+    sessionId: summary.sourceSession?.id,
+    targetAgent: normalized.targetAgent,
+    repoPath: normalized.repo.repoPath,
+    repoName: basename(normalized.repo.repoPath),
+    branch: normalized.repo.branch,
+    commit: normalized.repo.commit,
+    isGitRepo: normalized.repo.isGitRepo,
+    phase: summary.workPhase,
+    objective: truncate(oneLine(summary.originalQuestion), 280),
+    nextAction: truncate(oneLine(summary.nextAction), 280),
+    verification: summary.verification.status,
+    checks: {
+      passed: commands.filter((command) => command.status === "passed").length,
+      failed: commands.filter((command) => command.status === "failed").length,
+      unknown: commands.filter((command) => command.status === "unknown").length
+    },
+    plan: {
+      total: plan.length,
+      completed: plan.filter((item) => item.status === "completed").length,
+      inProgress: plan.filter((item) => item.status === "in_progress").length
+    },
+    files: {
+      count: changes.length,
+      additions: changes.reduce((sum, change) => sum + change.additions, 0),
+      deletions: changes.reduce((sum, change) => sum + change.deletions, 0),
+      paths: changes.slice(0, 50).map((change) => change.path)
+    },
+    blockers: summary.blockers.length,
+    tokens: normalized.tokenEstimate ?? estimateTokens(normalized.markdown),
+    transcriptItems: summary.sourceSession?.transcriptItems ?? 0
+  };
 }
 
 export function buildEngineeringMemory(

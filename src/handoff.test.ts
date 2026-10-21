@@ -1,7 +1,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
-import { buildHandoffSummary, buildSections, buildTeamTimelineExport, createHandoff, deriveContextBlocks, normalizeHandoffPacket, renderAgentContextMarkdown } from "./handoff.js";
+import { buildHandoffSummary, buildSections, buildTeamTimelineExport, createHandoff, deriveContextBlocks, normalizeHandoffPacket, renderAgentContextMarkdown, summarizeHandoff } from "./handoff.js";
 import { createContextPack, renderContextPackOutput } from "./pack.js";
 import { openStore } from "./store.js";
 import { claude, codex, commitAll, gitRepo, isolateEnv, tempDir, writeJsonl } from "./test-helpers.js";
@@ -211,6 +211,37 @@ describe("older packets", () => {
     const packet = normalizeHandoffPacket(legacy);
     expect(packet.handoffSummary?.fileChanges[0].path).toBe("src/legacy.ts");
     expect(renderAgentContextMarkdown(packet)).toContain("## Next action\nFinish legacy support.");
+  });
+
+  it("drops injected harness text that pre-0.2 captures kept as user messages", () => {
+    const packet = normalizeHandoffPacket({
+      ...legacy,
+      sourceSession: {
+        source: "codex",
+        id: "old-session",
+        path: "/tmp/old.jsonl",
+        updatedAt: legacy.createdAt,
+        matchedCwd: true,
+        lineCount: 4,
+        transcriptExcerpt: "",
+        transcript: [
+          { role: "user", text: "<environment_context>\n<cwd>/repo</cwd>\n<shell>zsh</shell>\n</environment_context>" },
+          { role: "user", text: "# AGENTS.md instructions for /repo\nDo not additionally call list_mcp_resources." },
+          { role: "user", text: "Rebuild the settings page with better UX." },
+          { role: "assistant", text: "Decided to keep the existing routes and only restyle the page." }
+        ]
+      }
+    });
+    expect(packet.handoffSummary?.originalQuestion).toBe("Rebuild the settings page with better UX.");
+    expect(packet.handoffSummary?.decisions).toEqual(["Decided to keep the existing routes and only restyle the page."]);
+    expect(deriveContextBlocks(packet).map((block) => block.text).join("\n")).not.toMatch(/environment_context|AGENTS\.md|list_mcp_resources/);
+  });
+
+  it("summarizes a handoff for lists without its transcript or diff", () => {
+    const item = summarizeHandoff(legacy);
+    expect(item).toMatchObject({ id: "old", task: "legacy", repoName: "repo", branch: "main", verification: "unknown", files: { count: 1, paths: ["src/legacy.ts"] } });
+    expect(summarizeHandoff({ ...legacy, markdown: "x".repeat(40) }).tokens).toBe(10);
+    expect(JSON.stringify(item)).not.toContain("ghp_");
   });
 
   it("redacts secrets in team exports even when the stored packet was not redacted", () => {

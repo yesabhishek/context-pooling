@@ -128,12 +128,13 @@ export class CtxStore {
     return Number(this.db.prepare("DELETE FROM context_packs WHERE id = ?").run(id).changes) > 0;
   }
 
-  getStatus(): { home: string; dbPath: string; teamExportsDir: string; handoffCount: number; taskCount: number; packCount: number } {
+  getStatus(): { home: string; dbPath: string; teamExportsDir: string; handoffCount: number; taskCount: number; packCount: number; latestAt?: string } {
     const paths = getCtxPaths();
     const counts = this.get(
       `SELECT (SELECT COUNT(*) FROM handoffs) AS handoffs,
               (SELECT COUNT(DISTINCT task) FROM handoffs) AS tasks,
-              (SELECT COUNT(*) FROM context_packs) AS packs`
+              (SELECT COUNT(*) FROM context_packs) AS packs,
+              (SELECT MAX(created_at) FROM handoffs) AS latestAt`
     )!;
     return {
       home: paths.home,
@@ -141,7 +142,8 @@ export class CtxStore {
       teamExportsDir: paths.teamExportsDir,
       handoffCount: Number(counts.handoffs),
       taskCount: Number(counts.tasks),
-      packCount: Number(counts.packs)
+      packCount: Number(counts.packs),
+      latestAt: counts.latestAt ? String(counts.latestAt) : undefined
     };
   }
 

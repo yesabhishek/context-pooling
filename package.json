@@ -1,6 +1,6 @@
 {
   "name": "ctxpool",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Hand off AI coding sessions between Codex, Claude, Gemini, Antigravity, and any MCP-capable agent.",
   "type": "module",
   "bin": {

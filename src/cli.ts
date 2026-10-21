@@ -40,7 +40,7 @@ program
       `  ctxpool handoff               ${style.dim("Hand off the latest session in this repo")}`,
       `  ctxpool handoff --from codex  ${style.dim("Choose when several agents were active")}`,
       `  ctxpool sessions              ${style.dim("See which sessions ContextPool can read")}`,
-      `  ctxpool ui                    ${style.dim("Curate reusable context packs in the browser")}`,
+      `  ctxpool ui                    ${style.dim("Browse handoffs in the browser")}`,
       ""
     ].join("\n")
   );
@@ -164,9 +164,16 @@ program
   .description("Print a saved handoff")
   .argument("[task]", "Task name, or `latest`", "latest")
   .option("--task <name>", "Task name")
+  .option("--id <id>", "A specific handoff id instead of a task's latest")
   .option("--json", "Print the full packet as JSON")
-  .action((target: string, options: { task?: string; json?: boolean }) =>
+  .action((target: string, options: { task?: string; id?: string; json?: boolean }) =>
     withStore((store) => {
+      if (options.id) {
+        const handoff = store.getHandoffById(options.id);
+        if (!handoff) throw new CtxError(`No handoff with id "${options.id}".`, "Pass a task name instead. `ctxpool tasks` lists them.");
+        if (options.json) return printJson(handoff);
+        return void process.stdout.write(`${handoff.markdown}\n`);
+      }
       const task = options.task || (target === "latest" ? undefined : target);
       const handoff = store.getLatestHandoff(task);
       if (!handoff) throw new CtxError(task ? `No handoff found for "${task}".` : "No handoffs yet.", "Run `ctxpool handoff` to capture one, or `ctxpool tasks` to list tasks.");
@@ -212,7 +219,7 @@ program
 
 program
   .command("ui")
-  .description("Open the context pack builder in your browser")
+  .description("Browse handoffs and build context packs in your browser")
   .option("--host <host>", "Host to bind")
   .option("--port <port>", "Port to bind", positiveInt)
   .option("--open", "Open the browser")
